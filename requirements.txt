@@ -1,1 +1,8 @@
+fastapi
+uvicorn[standard]
+torch
+transformers
+langchain
+faiss-cpu
+python-multipart
 
