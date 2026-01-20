@@ -12,7 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY core ./core
 COPY rag ./rag
 COPY model ./model
-COPY vector_db ./vector_db
 COPY api.py .
 
 # Expose port
