@@ -12,7 +12,7 @@ VECTOR_DIR = "vector_db"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
-app = FastAPI(title="Medical Chatbot SLM Component")
+app = FastAPI(title="Chatbot SLM Component")
 
 slm_component = None
 
