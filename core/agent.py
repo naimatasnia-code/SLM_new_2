@@ -9,7 +9,7 @@ class MedicalAgent:
 
     def answer(self, question: str):
         docs = self.retriever.invoke(question)
-        context = "\n".join(d.page_content for d in docs)
+        context = "\n".join(d.page_content[:800] for d in docs)
 
         prompt = build_prompt(context, question)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
