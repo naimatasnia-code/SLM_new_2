@@ -36,8 +36,8 @@ def build_index(file_paths, vector_dir):
         raise ValueError("No text could be loaded from documents.")
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
+        chunk_size=300,
+        chunk_overlap=50
     )
 
     chunks = splitter.split_documents(all_docs)
@@ -48,7 +48,7 @@ def build_index(file_paths, vector_dir):
     print(f"Total chunks created: {len(chunks)}")
 
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name="sentence-transformers/paraphrase-MiniLM-L3-v2"
     )
 
     vectorstore = FAISS.from_documents(chunks, embeddings)
@@ -57,7 +57,3 @@ def build_index(file_paths, vector_dir):
     vectorstore.save_local(vector_dir)
 
     print("Vector DB created at:", vector_dir)
-
-
-
-
