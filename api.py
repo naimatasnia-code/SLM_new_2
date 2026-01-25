@@ -2,6 +2,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import os
 import shutil
+import time
+import asyncio
+from fastapi.concurrency import run_in_threadpool
+
 
 from rag.indexer import build_index
 from core.component import SLMComponent
@@ -65,11 +69,20 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.post("/chat", response_model=QueryResponse)
-def chat(req: QueryRequest):
+async def chat(req: QueryRequest):
     if slm_component is None:
         raise HTTPException(
             status_code=400,
             detail="No document indexed yet. Upload a document first."
         )
 
-    return slm_component.run(req.question)
+    start = time.time()
+
+    result = await run_in_threadpool(
+        slm_component.run,
+        req.question
+    )
+
+    result["latency_sec"] = round(time.time() - start, 2)
+    return result
+
