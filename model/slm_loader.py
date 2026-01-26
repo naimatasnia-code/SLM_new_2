@@ -1,6 +1,6 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-import torch
-
+from peft import PeftModel import torch 
+MODELS = { "phi-2": "microsoft/phi-2", "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0" }
 def load_slm(
     model_name: str,
     lora_path: str | None = None,
