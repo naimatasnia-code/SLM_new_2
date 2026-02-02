@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY core ./core
 COPY rag ./rag
 COPY model ./model
+COPY data ./data
 COPY api.py .
 
 # Expose port
