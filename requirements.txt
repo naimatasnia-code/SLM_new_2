@@ -6,11 +6,12 @@ torch
 transformers
 sentence-transformers
 faiss-cpu
-langchain-huggingface
-peft 
-bitsandbytes
+langchain-huggingface 
+datasets
+peft
+accelerate
 pypdf
 uvicorn
-accelerate
+
 
 
