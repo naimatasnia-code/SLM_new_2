@@ -2,7 +2,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import time, os, shutil, json
 from fastapi.concurrency import run_in_threadpool
-from model.model_registry import MODEL_REGISTRY
 from rag.indexer import build_index, load_documents
 
 
@@ -60,8 +59,6 @@ async def upload_document(file: UploadFile = File(...)):
 @app.post("/setup")
 async def setup(req: ModeRequest):
     global slm_component
-    model_name = MODEL_REGISTRY.get(req.model, req.model)
-
     if req.mode not in ["rag", "finetune"]:
         raise HTTPException(400, "mode must be rag or finetune")
 
