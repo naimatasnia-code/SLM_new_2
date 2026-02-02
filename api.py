@@ -5,6 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from model.model_registry import MODEL_REGISTRY
 from rag.indexer import build_index, load_documents
 
+
 from core.component import SLMComponent
 from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
@@ -26,7 +27,7 @@ app = FastAPI(title="Loop SLM Orchestrator")
 
 slm_component = None
 
-# Schemas
+# 
 class ModeRequest(BaseModel):
     mode: str   # "rag" or "finetune"
     model: str  # "phi-2" or "tinyllama"
@@ -59,19 +60,17 @@ async def upload_document(file: UploadFile = File(...)):
 @app.post("/setup")
 async def setup(req: ModeRequest):
     global slm_component
-
-    # Resolve model from registry
     model_name = MODEL_REGISTRY.get(req.model, req.model)
 
     if req.mode not in ["rag", "finetune"]:
         raise HTTPException(400, "mode must be rag or finetune")
 
-    # ---------------- RAG ----------------
+    # RAG
     if req.mode == "rag":
-        slm_component = SLMComponent(model_name=model_name, vector_dir=VECTOR_DIR)
-        return {"status": "ready", "mode": "rag", "model": model_name}
+        slm_component = SLMComponent(model_name=req.model, vector_dir=VECTOR_DIR)
+        return {"status": "ready", "mode": "rag", "model": req.model}
 
-    # ---------------- FINETUNE ----------------
+    # Finetune
     if req.mode == "finetune":
 
         # Load docs
@@ -85,15 +84,17 @@ async def setup(req: ModeRequest):
             data = [json.loads(l) for l in f]
         dataset = Dataset.from_list(data)
 
-        # Train LoRA using registry model
-        await run_in_threadpool(train_domain_lora, model_name, dataset, LORA_DIR)
+        # Train LoRA (CPU optimized)
+        await run_in_threadpool(train_domain_lora, req.model, dataset, LORA_DIR)
 
-        # Load domain adapted model using registry model
-        slm_component = DomainSLMComponent(model_name, VECTOR_DIR, LORA_DIR)
+        # Load domain adapted model
+        slm_component = DomainSLMComponent(req.model, VECTOR_DIR, LORA_DIR)
 
-        return {"status": "ready", "mode": "finetune", "model": model_name}
+        return {"status": "ready", "mode": "finetune", "model": req.model}
 
+# 
 # Chat Endpoint
+# 
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest):
     global slm_component
