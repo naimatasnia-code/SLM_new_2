@@ -2,10 +2,8 @@ import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model
-from model.model_registry import MODEL_REGISTRY
 
 def train_domain_lora(model_id, dataset: Dataset, output_dir):
-    model_id = MODEL_REGISTRY.get(model_id, model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
