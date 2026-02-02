@@ -67,4 +67,43 @@ async def setup(req: ModeRequest):
         raise HTTPException(400, "mode must be rag or finetune")
 
     # ---------------- RAG ----------------
-    if
+    if req.mode == "rag":
+        slm_component = SLMComponent(model_name=model_name, vector_dir=VECTOR_DIR)
+        return {"status": "ready", "mode": "rag", "model": model_name}
+
+    # ---------------- FINETUNE ----------------
+    if req.mode == "finetune":
+
+        # Load docs
+        docs = await run_in_threadpool(load_documents, [UPLOAD_DIR])
+
+        # Build dataset
+        await run_in_threadpool(build_domain_dataset, docs, DATASET_PATH)
+
+        # Load dataset JSONL
+        with open(DATASET_PATH) as f:
+            data = [json.loads(l) for l in f]
+        dataset = Dataset.from_list(data)
+
+        # Train LoRA using registry model
+        await run_in_threadpool(train_domain_lora, model_name, dataset, LORA_DIR)
+
+        # Load domain adapted model using registry model
+        slm_component = DomainSLMComponent(model_name, VECTOR_DIR, LORA_DIR)
+
+        return {"status": "ready", "mode": "finetune", "model": model_name}
+
+# Chat Endpoint
+@app.post("/chat", response_model=QueryResponse)
+async def chat(req: QueryRequest):
+    global slm_component
+
+    if slm_component is None:
+        raise HTTPException(400, "Model not initialized. Call /setup first.")
+
+    start = time.time()
+
+    result = await run_in_threadpool(slm_component.run, req.question)
+
+    result["latency_sec"] = round(time.time() - start, 3)
+    return result
