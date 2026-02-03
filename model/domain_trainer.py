@@ -4,10 +4,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model
 
 def train_domain_lora(model_id, dataset: Dataset, output_dir):
+    from model.model_registry import MODELS
+    model_id = MODELS[model_id]
+
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # CPU model load
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float32,
@@ -17,10 +19,11 @@ def train_domain_lora(model_id, dataset: Dataset, output_dir):
     lora = LoraConfig(
         r=2,
         lora_alpha=4,
-        target_modules=["q_proj","v_proj"],
+        target_modules=["q_proj","k_proj","v_proj","o_proj"],
         lora_dropout=0.1,
         task_type="CAUSAL_LM"
     )
+
     model = get_peft_model(model, lora)
 
     def tokenize(x):
@@ -28,7 +31,7 @@ def train_domain_lora(model_id, dataset: Dataset, output_dir):
         out["labels"] = out["input_ids"]
         return out
 
-    dataset = dataset.map(tokenize)
+    dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
 
     args = TrainingArguments(
         output_dir=output_dir,
@@ -36,7 +39,8 @@ def train_domain_lora(model_id, dataset: Dataset, output_dir):
         num_train_epochs=1,
         logging_steps=10,
         save_strategy="epoch",
-        report_to="none"
+        report_to="none",
+        remove_unused_columns=False
     )
 
     trainer = Trainer(model=model, args=args, train_dataset=dataset)
@@ -44,3 +48,4 @@ def train_domain_lora(model_id, dataset: Dataset, output_dir):
 
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+
