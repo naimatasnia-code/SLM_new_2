@@ -4,11 +4,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model
 
 def train_domain_lora(model_id, dataset: Dataset, output_dir):
-    from model.model_registry import MODELS
+    MODELS = { "phi-2": "microsoft/phi-2", "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "qwen-0.5b": "Qwen/Qwen2.5-0.5B-Instruct" }
     model_id = MODELS[model_id]
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+
+        tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -28,10 +30,10 @@ def train_domain_lora(model_id, dataset: Dataset, output_dir):
 
     def tokenize(x):
         out = tokenizer(x["text"], truncation=True, padding="max_length", max_length=256)
-        out["labels"] = out["input_ids"]
+        out["labels"] = out["input_ids"].copy()
         return out
 
-    dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
+    dataset = dataset.map(tokenize,remove_columns=dataset.column_names)
 
     args = TrainingArguments(
         output_dir=output_dir,
