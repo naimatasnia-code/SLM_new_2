@@ -48,7 +48,7 @@ def build_index(file_paths, vector_dir):
     print(f"Total chunks created: {len(chunks)}")
 
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/paraphrase-MiniLM-L3-v2"
+        model_name="BAAI/bge-small-en-v1.5"
     )
 
     vectorstore = FAISS.from_documents(chunks, embeddings)
