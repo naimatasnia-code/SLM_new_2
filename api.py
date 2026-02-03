@@ -4,7 +4,6 @@ import time, os, shutil, json
 from fastapi.concurrency import run_in_threadpool
 from rag.indexer import build_index, load_documents
 
-
 from core.component import SLMComponent
 from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
@@ -22,14 +21,15 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 # FastAPI
-app = FastAPI(title="Loop SLM Orchestrator")
+app = FastAPI(title="SLM Component")
 
 slm_component = None
+current_mode = None
+current_model = None
 
-# 
+# Schemas
 class ModeRequest(BaseModel):
-    mode: str   # "rag" or "finetune"
-    model: str  # "phi-2" or "tinyllama"
+    model: str  # "phi-2" | "tinyllama" | "qwen-0.5b"
 
 class QueryRequest(BaseModel):
     question: str
@@ -43,65 +43,80 @@ class QueryResponse(BaseModel):
     model: str
     domain_adapter: bool = False
 
-# Upload Files
-@app.post("/upload")
+
+# Upload Node
+@app.post("/node/upload")
 async def upload_document(file: UploadFile = File(...)):
     path = os.path.join(UPLOAD_DIR, file.filename)
     with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Index in threadpool
+    # Index inside upload (as requested)
     await run_in_threadpool(build_index, [path], VECTOR_DIR)
 
-    return {"status": "uploaded", "file": file.filename}
+    return {"node": "upload", "status": "uploaded", "file": file.filename}
 
-# Setup Mode (RAG or FineTune)
-@app.post("/setup")
-async def setup(req: ModeRequest):
-    global slm_component
-    if req.mode not in ["rag", "finetune"]:
-        raise HTTPException(400, "mode must be rag or finetune")
-
-    # RAG
-    if req.mode == "rag":
-        slm_component = SLMComponent(model_name=req.model, vector_dir=VECTOR_DIR)
-        return {"status": "ready", "mode": "rag", "model": req.model}
-
-    # Finetune
-    if req.mode == "finetune":
-
-        # Load docs
-        docs = await run_in_threadpool(load_documents, [UPLOAD_DIR])
-
-        # Build dataset
-        await run_in_threadpool(build_domain_dataset, docs, DATASET_PATH)
-
-        # Load dataset JSONL
-        with open(DATASET_PATH) as f:
-            data = [json.loads(l) for l in f]
-        dataset = Dataset.from_list(data)
-
-        # Train LoRA (CPU optimized)
-        await run_in_threadpool(train_domain_lora, req.model, dataset, LORA_DIR)
-
-        # Load domain adapted model
-        slm_component = DomainSLMComponent(req.model, VECTOR_DIR, LORA_DIR)
-
-        return {"status": "ready", "mode": "finetune", "model": req.model}
 
 # 
-# Chat Endpoint
+# RAG Node
 # 
-@app.post("/chat", response_model=QueryResponse)
-async def chat(req: QueryRequest):
+@app.post("/node/rag")
+async def rag_node(req: ModeRequest):
+    global slm_component, current_mode, current_model
+
+    slm_component = SLMComponent(model_name=req.model, vector_dir=VECTOR_DIR)
+    current_mode = "rag"
+    current_model = req.model
+
+    return {"node": "rag", "status": "ready", "model": req.model}
+
+
+# Fine-tune Node
+@app.post("/node/finetune")
+async def finetune_node(req: ModeRequest):
+    global slm_component, current_mode, current_model
+
+    # Load docs
+    docs = await run_in_threadpool(load_documents, [UPLOAD_DIR])
+
+    # Build dataset
+    await run_in_threadpool(build_domain_dataset, docs, DATASET_PATH)
+
+    # Load dataset JSONL
+    with open(DATASET_PATH) as f:
+        data = [json.loads(l) for l in f]
+    dataset = Dataset.from_list(data)
+
+    # Train LoRA
+    await run_in_threadpool(train_domain_lora, req.model, dataset, LORA_DIR)
+
+    # Load adapted model
+    slm_component = DomainSLMComponent(req.model, VECTOR_DIR, LORA_DIR)
+
+    current_mode = "finetune"
+    current_model = req.model
+
+    return {"node": "finetune", "status": "ready", "model": req.model}
+
+
+# Inference Node (raw generation)
+@app.post("/node/inference", response_model=QueryResponse)
+async def inference_node(req: QueryRequest):
     global slm_component
 
     if slm_component is None:
-        raise HTTPException(400, "Model not initialized. Call /setup first.")
+        raise HTTPException(400, "Model not initialized")
 
     start = time.time()
-
     result = await run_in_threadpool(slm_component.run, req.question)
-
     result["latency_sec"] = round(time.time() - start, 3)
+    result["domain_adapter"] = (current_mode == "finetune")
+
     return result
+
+
+# Chat Node (alias of inference for UI)
+@app.post("/chat", response_model=QueryResponse)
+async def chat(req: QueryRequest):
+    # Reuse inference node logic
+    return await inference_node(req)
