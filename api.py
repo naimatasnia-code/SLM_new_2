@@ -77,7 +77,8 @@ async def finetune_node(req: ModeRequest):
     global slm_component, current_mode, current_model
 
     # Load docs
-    docs = await run_in_threadpool(load_documents, [UPLOAD_DIR])
+    file_paths = [os.path.join(UPLOAD_DIR, f) for f in os.listdir(UPLOAD_DIR)]
+    docs = await run_in_threadpool(load_documents, file_paths)
 
     # Build dataset
     await run_in_threadpool(build_domain_dataset, docs, DATASET_PATH)
@@ -85,6 +86,9 @@ async def finetune_node(req: ModeRequest):
     # Load dataset JSONL
     with open(DATASET_PATH) as f:
         data = [json.loads(l) for l in f]
+    if len(data) == 0:
+        raise HTTPException(500, "Dataset is empty. No training samples generated.")
+
     dataset = Dataset.from_list(data)
 
     # Train LoRA
