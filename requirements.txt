@@ -13,5 +13,7 @@ accelerate
 pypdf
 uvicorn
 
+accelerate
+minio>=7.2
 
 
