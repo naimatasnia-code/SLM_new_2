@@ -1,8 +1,15 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import time, os, shutil, json
-from fastapi.concurrency import run_in_threadpool
+
 from rag.indexer import build_index, load_documents
+
+import os
+import shutil
+import time
+import asyncio
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 
 from core.component import SLMComponent
 from core.domain_component import DomainSLMComponent
@@ -20,8 +27,14 @@ os.makedirs("data", exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
-# FastAPI
-app = FastAPI(title="SLM Component")
+app = FastAPI(title="Chatbot SLM Component")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 slm_component = None
 current_mode = None
@@ -109,7 +122,11 @@ async def inference_node(req: QueryRequest):
     global slm_component
 
     if slm_component is None:
-        raise HTTPException(400, "Model not initialized")
+        await asyncio.sleep(5)
+        raise HTTPException(
+            status_code=400,
+            detail="No document indexed yet. Upload a document first."
+        )
 
     start = time.time()
     result = await run_in_threadpool(slm_component.run, req.question)
