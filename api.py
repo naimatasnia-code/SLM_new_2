@@ -4,6 +4,8 @@ import time, os, shutil, json
 
 from rag.indexer import build_index, load_documents
 
+from minio import Minio
+
 import os
 import shutil
 import time
@@ -11,6 +13,9 @@ import asyncio
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
+import datetime
+
+from rag.indexer import build_index
 from core.component import SLMComponent
 from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
@@ -24,6 +29,18 @@ DATASET_PATH = "data/train.jsonl"
 LORA_DIR = "lora_adapter"
 
 os.makedirs("data", exist_ok=True)
+MINIO_API_HOST = os.getenv("MINIO_API_HOST", "192.168.1.10:9000")
+ACCESS_KEY = os.getenv("ACCESS_KEY", "minio")
+SECRET_KEY = os.getenv("SECRET_KEY", "password")
+NODE_STORAGE_REF = os.getenv("NODE_STORAGE_REF", "nodes_bucket")
+
+MINIO_CLIENT = Minio(
+    MINIO_API_HOST,
+    access_key=ACCESS_KEY,
+    secret_key=SECRET_KEY,
+    secure=False,
+)
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
@@ -122,7 +139,9 @@ async def inference_node(req: QueryRequest):
     global slm_component
 
     if slm_component is None:
+        print(F"Chat slm_component is None {datetime.datetime.now()}")
         await asyncio.sleep(5)
+        print(F"Chat slm_component is None {datetime.datetime.now()}")
         raise HTTPException(
             status_code=400,
             detail="No document indexed yet. Upload a document first."
