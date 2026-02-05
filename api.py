@@ -15,7 +15,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import datetime
 
-from rag.indexer import build_index
 from core.component import SLMComponent
 from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
