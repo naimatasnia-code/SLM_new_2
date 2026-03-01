@@ -1,7 +1,15 @@
+"""
 
+Key optimizations:
+- gradient_checkpointing: recompute activations instead of storing → -40% RAM
+- max_length=128: half the sequence memory vs 256
+- gradient_accumulation_steps=4: effective batch=4 with batch_size=1
+- low_cpu_mem_usage=True: streams weights during load → lower peak RAM
+- del model + gc.collect() after training: self-destructs to free RAM
+- Hard blocks phi-2 on CPU (needs 6-7 GB, won't fit in 4 GB)
+"""
 
 import gc
-import os
 import torch
 from datasets import Dataset
 from transformers import (
@@ -25,13 +33,20 @@ def train_domain_lora(
     model_name: str,
     dataset: Dataset,
     output_dir: str,
-):
+) -> None:
+    """
+    Fine-tunes a LoRA adapter on the provided dataset.
+    Saves only the adapter (not full model weights) to output_dir.
+    Self-destructs after saving to free RAM for inference model reload.
+
+    Raises MemoryError if phi-2 is requested on CPU.
+    """
     has_gpu = torch.cuda.is_available()
 
     if not has_gpu and model_name not in CPU_SAFE_MODELS:
         raise MemoryError(
-            f"Model '{model_name}' is too large to fine-tune on CPU with 4 GB RAM. "
-            "Use 'tinyllama' or 'qwen-0.5b'."
+            f"Model '{model_name}' requires ~6 GB RAM to fine-tune on CPU. "
+            f"Use 'tinyllama' or 'qwen-0.5b' for 4 GB environments."
         )
 
     model_id = MODELS[model_name]
@@ -39,26 +54,26 @@ def train_domain_lora(
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token     = tokenizer.eos_token
+        tokenizer.pad_token_id  = tokenizer.eos_token_id
 
-    # ── Load model fresh for training (low memory) ────────────────────────────
-    print("[trainer] Loading model for fine-tuning...")
+    # ── Load model (RAM-safe) ─────────────────────────────────────────────────
+    print(f"[trainer] Loading {model_name} for fine-tuning...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float32,   # CPU requires float32
         device_map=None,             # keep on CPU
-        low_cpu_mem_usage=True,      # stream weights → lower peak RAM
+        low_cpu_mem_usage=True,      # streams weights → lower peak RAM
     )
 
-    # Gradient checkpointing: recompute activations instead of storing them
-    # Cuts ~40% RAM at cost of ~20% slower training — worth it on 4 GB
+    # Gradient checkpointing: recomputes activations during backprop
+    # instead of caching them → saves ~40% training RAM at cost of ~20% speed
     model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()   # required when using grad checkpointing + PEFT
+    model.enable_input_require_grads()   # required with grad checkpointing + PEFT
 
-    # ── LoRA (minimal footprint) ──────────────────────────────────────────────
+    # ── LoRA config (minimal rank = tiny adapter, minimal extra RAM) ──────────
     lora_cfg = LoraConfig(
-        r=2,                  # very small rank → tiny adapter
+        r=2,                  # very small rank → tiny adapter footprint
         lora_alpha=4,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         lora_dropout=0.05,
@@ -68,23 +83,23 @@ def train_domain_lora(
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # ── Tokenize dataset ──────────────────────────────────────────────────────
+    # ── Tokenize ──────────────────────────────────────────────────────────────
     def tokenize(x):
         out = tokenizer(
             x["text"],
             truncation=True,
             padding="max_length",
-            max_length=128,      # was 256 → halves sequence memory
+            max_length=128,       # was 256 → halves sequence tensor memory
         )
         out["labels"] = out["input_ids"].copy()
         return out
 
     tokenized = dataset.map(tokenize, remove_columns=dataset.column_names)
 
-    # ── Training args (CPU-safe) ───────────────────────────────────────────────
+    # ── Training args ─────────────────────────────────────────────────────────
     args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=1,       # minimum batch
+        per_device_train_batch_size=1,       # minimum memory per step
         gradient_accumulation_steps=4,       # effective batch=4 without RAM cost
         num_train_epochs=1,
         logging_steps=10,
@@ -93,9 +108,9 @@ def train_domain_lora(
         remove_unused_columns=False,
         fp16=False,                          # CPU does not support fp16 training
         bf16=False,
-        dataloader_pin_memory=False,         # pin_memory needs CUDA
-        no_cuda=not has_gpu,                 # explicit CPU-only flag
-        optim="adamw_torch",                 # lightweight optimizer
+        dataloader_pin_memory=False,         # requires CUDA
+        no_cuda=not has_gpu,
+        optim="adamw_torch",                 # lightweight standard optimizer
     )
 
     trainer = Trainer(
@@ -105,14 +120,14 @@ def train_domain_lora(
     )
     trainer.train()
 
-    # ── Save adapter only (not full model weights) ────────────────────────────
+    # ── Save adapter only ─────────────────────────────────────────────────────
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"[trainer] LoRA adapter saved → {output_dir}")
 
-    # ── Unload training model immediately to free RAM ─────────────────────────
-    del model
+    # ── Self-destruct to free RAM ─────────────────────────────────────────────
     del trainer
+    del model
     gc.collect()
     if has_gpu:
         torch.cuda.empty_cache()
