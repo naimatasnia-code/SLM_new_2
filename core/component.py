@@ -1,9 +1,8 @@
 
-
 import time
 from rag.retriever import load_retriever
 from model.slm_loader import load_slm
-from core.agent import MedicalAgent
+from core.agent import DocumentAgent
 
 
 class SLMComponent:
@@ -25,7 +24,7 @@ class SLMComponent:
         if use_rag and vector_dir:
             retriever = load_retriever(vector_dir, top_k)
 
-        self.agent = MedicalAgent(self.tokenizer, self.model, retriever)
+        self.agent = DocumentAgent(self.tokenizer, self.model, retriever)
 
     def run(self, question: str) -> dict:
         start = time.time()
