@@ -33,10 +33,10 @@ os.makedirs(UPLOAD_DIR,  exist_ok=True)
 os.makedirs(VECTOR_DIR,  exist_ok=True)
 
 # ── MinIO ─────────────────────────────────────────────────────────────────────
-MINIO_API_HOST    = os.getenv("MINIO_API_HOST",    "192.168.1.10:9000")
-ACCESS_KEY        = os.getenv("ACCESS_KEY",        "minio")
-SECRET_KEY        = os.getenv("SECRET_KEY",        "password")
-NODE_STORAGE_REF  = os.getenv("NODE_STORAGE_REF",  "nodes_bucket")
+MINIO_API_HOST   = os.getenv("MINIO_API_HOST",   "192.168.1.10:9000")
+ACCESS_KEY       = os.getenv("ACCESS_KEY",       "minio")
+SECRET_KEY       = os.getenv("SECRET_KEY",       "password")
+NODE_STORAGE_REF = os.getenv("NODE_STORAGE_REF", "nodes_bucket")
 
 MINIO_CLIENT = Minio(
     MINIO_API_HOST,
@@ -45,9 +45,9 @@ MINIO_CLIENT = Minio(
     secure=False,
 )
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-HAS_GPU        = torch.cuda.is_available()
-CPU_SAFE_MODELS = {"tinyllama", "qwen-0.5b"}   # fit in 4 GB RAM on CPU
+# ── Hardware constants ────────────────────────────────────────────────────────
+HAS_GPU         = torch.cuda.is_available()
+CPU_SAFE_MODELS = {"tinyllama", "qwen-0.5b"}
 ALL_MODELS      = {"phi-2", "tinyllama", "qwen-0.5b"}
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -61,14 +61,19 @@ app.add_middleware(
 )
 
 # ── Global state ──────────────────────────────────────────────────────────────
-slm_component: SLMComponent | DomainSLMComponent | None = None
-current_mode:  str | None = None
-current_model: str | None = None
+slm_component = None
+current_mode  = None
+current_model = None
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ModeRequest(BaseModel):
-    model: str   # "phi-2" | "tinyllama" | "qwen-0.5b"
+    model: str
+
+class FineTuneRequest(BaseModel):
+    model: str
+    epochs: int = 1
+    samples_per_chunk: int = 2
 
 class QueryRequest(BaseModel):
     question: str
@@ -84,8 +89,7 @@ class QueryResponse(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _validate_model(model_name: str):
-    """Raises 400 if model unknown or unsafe for current hardware."""
+def _validate_model(model_name: str) -> None:
     if model_name not in ALL_MODELS:
         raise HTTPException(
             status_code=400,
@@ -95,30 +99,28 @@ def _validate_model(model_name: str):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Model '{model_name}' requires a GPU and will exceed 4 GB RAM on CPU. "
-                f"Please use one of: {sorted(CPU_SAFE_MODELS)}"
+                f"Model '{model_name}' requires ~6 GB RAM on CPU. "
+                f"For 4 GB environments use: {sorted(CPU_SAFE_MODELS)}"
             ),
         )
 
 
-def _unload_current_model():
-    """Frees RAM by deleting the currently loaded model before loading a new one."""
+def _unload_current_model() -> None:
     global slm_component
     if slm_component is not None:
-        print("[api] Unloading current model to free RAM...")
+        print("[api] Unloading current model...")
         del slm_component
         slm_component = None
         gc.collect()
         if HAS_GPU:
             torch.cuda.empty_cache()
-        print("[api] Model unloaded.")
+        print("[api] Model unloaded. RAM freed.")
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    """Reports system status, RAM, GPU, and loaded model."""
     import psutil
     mem = psutil.virtual_memory()
     return {
@@ -135,75 +137,137 @@ async def health():
 
 @app.post("/node/upload")
 async def upload_document(file: UploadFile = File(...)):
+    """Upload a PDF or DOCX and index it into the vector DB."""
     path = os.path.join(UPLOAD_DIR, file.filename)
     with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
-
     await run_in_threadpool(build_index, [path], VECTOR_DIR)
-
-    return {"node": "upload", "status": "uploaded", "file": file.filename}
+    return {"node": "upload", "status": "indexed", "file": file.filename}
 
 
 @app.post("/node/rag")
 async def rag_node(req: ModeRequest):
+    """Load model in RAG-only mode (no fine-tuning)."""
     global slm_component, current_mode, current_model
 
-    _validate_model(req.model)       # blocks phi-2 on CPU
-    _unload_current_model()          # free RAM before loading new model
+    _validate_model(req.model)
+    _unload_current_model()
 
     slm_component = await run_in_threadpool(
-        lambda: SLMComponent(model_name=req.model, vector_dir=VECTOR_DIR)
+        lambda: SLMComponent(model_name=req.model, vector_dir=VECTOR_DIR, top_k=5)
     )
     current_mode  = "rag"
     current_model = req.model
-
     return {"node": "rag", "status": "ready", "model": req.model}
 
 
 @app.post("/node/finetune")
-async def finetune_node(req: ModeRequest):
+async def finetune_node(req: FineTuneRequest):
+    """
+    Fine-tune a LoRA adapter on uploaded documents, then reload in RAG mode.
+
+    Body params:
+      model             : "qwen-0.5b" | "tinyllama"  (phi-2 blocked on CPU)
+      epochs            : training epochs (default: 1, keep low for 4 GB)
+      samples_per_chunk : Q&A pairs per document chunk (default: 2)
+
+    Prerequisites:
+      - Upload at least one document via POST /node/upload first.
+
+    Returns:
+      training_samples : number of examples the model was trained on
+      adapter_path     : where the LoRA adapter was saved
+    """
     global slm_component, current_mode, current_model
 
     _validate_model(req.model)
 
-    # ── Step 1: unload inference model FIRST → frees RAM for training ─────────
+    # ── Step 1: free RAM ──────────────────────────────────────────────────────
     _unload_current_model()
 
-    # ── Step 2: build dataset ─────────────────────────────────────────────────
-    file_paths = [os.path.join(UPLOAD_DIR, f) for f in os.listdir(UPLOAD_DIR)]
+    # ── Step 2: collect uploaded files ───────────────────────────────────────
+    file_paths = [
+        os.path.join(UPLOAD_DIR, f)
+        for f in os.listdir(UPLOAD_DIR)
+        if f.lower().endswith((".pdf", ".docx"))
+    ]
+    if not file_paths:
+        raise HTTPException(
+            status_code=400,
+            detail="No documents found. Upload at least one PDF or DOCX via /node/upload first.",
+        )
+
+    # ── Step 3: load document text ────────────────────────────────────────────
     docs = await run_in_threadpool(load_documents, file_paths)
-    await run_in_threadpool(build_domain_dataset, docs, DATASET_PATH)
+    if not docs:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not extract text from uploaded documents.",
+        )
+
+    # ── Step 4: build training dataset ───────────────────────────────────────
+    # Creates instruction-following Q&A pairs + negative (out-of-scope) samples
+    n_samples = await run_in_threadpool(
+        build_domain_dataset,
+        docs,
+        DATASET_PATH,
+        80,                     # min_chunk_len — skip noise/header chunks
+        req.samples_per_chunk,  # Q&A pairs per chunk
+        0.15,                   # 15% out-of-scope negative samples
+    )
+    if n_samples == 0:
+        raise HTTPException(
+            status_code=500,
+            detail="Dataset generation produced 0 samples. Check document content.",
+        )
+    print(f"[api] Built {n_samples} training samples from {len(file_paths)} file(s).")
 
     with open(DATASET_PATH) as f:
-        data = [json.loads(line) for line in f]
-    if not data:
-        raise HTTPException(500, "Dataset is empty. No training samples generated.")
+        data = [json.loads(line) for line in f if line.strip()]
 
     dataset = Dataset.from_list(data)
 
-    # ── Step 3: train LoRA (training model loads, trains, then self-unloads) ──
+    # ── Step 5: train LoRA adapter ────────────────────────────────────────────
+    # domain_trainer loads model → trains → saves adapter → self-destructs
+    # So only one model in RAM at a time (critical for 4 GB)
     try:
         await run_in_threadpool(train_domain_lora, req.model, dataset, LORA_DIR)
     except MemoryError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
 
-    # ── Step 4: reload inference model with LoRA adapter ─────────────────────
-    slm_component = await run_in_threadpool(
-        lambda: DomainSLMComponent(req.model, VECTOR_DIR, LORA_DIR)
-    )
+    # ── Step 6: reload inference model with adapter ───────────────────────────
+    # RAM is now free (trainer self-destructed after Step 5)
+    try:
+        slm_component = await run_in_threadpool(
+            lambda: DomainSLMComponent(req.model, VECTOR_DIR, LORA_DIR)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Fine-tune succeeded but failed to reload model: {str(e)}",
+        )
+
     current_mode  = "finetune"
     current_model = req.model
 
-    return {"node": "finetune", "status": "ready", "model": req.model}
+    return {
+        "node":             "finetune",
+        "status":           "ready",
+        "model":            req.model,
+        "training_samples": n_samples,
+        "adapter_path":     LORA_DIR,
+    }
 
 
 @app.post("/node/inference", response_model=QueryResponse)
 async def inference_node(req: QueryRequest):
+    """Query the currently loaded model."""
     global slm_component
 
     if slm_component is None:
-        print(f"[api] slm_component is None at {datetime.datetime.now()}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
         if slm_component is None:
             raise HTTPException(
                 status_code=400,
@@ -219,4 +283,5 @@ async def inference_node(req: QueryRequest):
 
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest):
+    """Alias for /node/inference."""
     return await inference_node(req)
