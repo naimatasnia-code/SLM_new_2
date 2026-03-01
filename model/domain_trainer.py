@@ -1,4 +1,7 @@
 """
+model/domain_trainer.py
+=======================
+Memory-safe LoRA fine-tuning for 4 GB CPU environments.
 
 Key optimizations:
 - gradient_checkpointing: recompute activations instead of storing → -40% RAM
@@ -66,11 +69,6 @@ def train_domain_lora(
         low_cpu_mem_usage=True,      # streams weights → lower peak RAM
     )
 
-    # Gradient checkpointing: recomputes activations during backprop
-    # instead of caching them → saves ~40% training RAM at cost of ~20% speed
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()   # required with grad checkpointing + PEFT
-
     # ── LoRA config (minimal rank = tiny adapter, minimal extra RAM) ──────────
     lora_cfg = LoraConfig(
         r=2,                  # very small rank → tiny adapter footprint
@@ -81,6 +79,14 @@ def train_domain_lora(
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
+
+    # IMPORTANT: gradient checkpointing and enable_input_require_grads MUST be
+    # called AFTER get_peft_model(). get_peft_model() replaces the model object,
+    # so any hooks set before it are lost and cause:
+    #   "element 0 of tensors does not require grad and does not have a grad_fn"
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+
     model.print_trainable_parameters()
 
     # ── Tokenize ──────────────────────────────────────────────────────────────
