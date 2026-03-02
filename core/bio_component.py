@@ -12,7 +12,7 @@ class BioSLMComponent:
     def __init__(
         self,
         model_name: str,
-        chroma_path: str = "./chroma_db_final",
+        chroma_path: str = "rag/chroma_db",
         lora_path: str | None = None,
     ):
         self.tokenizer, self.model = load_slm(
