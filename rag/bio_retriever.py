@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rag_retriever import BioRAG
+from rag.rag_retriever import BioRAG
 from langchain.schema import Document
 
 
