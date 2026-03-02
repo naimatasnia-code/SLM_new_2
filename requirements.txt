@@ -19,3 +19,4 @@ unstructured
 python-docx
 minio>=7.2
 psutil
+pysqlite3-binary
