@@ -1,5 +1,7 @@
 """
-core/prompt.py  –  Strict grounding prompt
+core/prompt.py
+==============
+Prompt templates and static chat responses.
 """
 
 
@@ -25,10 +27,25 @@ ANSWER (from CONTEXT only, stop when done):"""
 
 def build_chat_response(intent: str, question: str = "") -> str:
     responses = {
-        "greeting":     "Hello! I'm your document assistant. Upload any file and ask me anything about it.",
-        "thanks":       "You're welcome! Feel free to ask more questions about your documents.",
-        "farewell":     "Goodbye! Come back anytime you need help with your documents.",
-        "no_docs":      "No documents have been uploaded yet. Please upload a file first.",
-        "out_of_scope": "I don't have information about this in the provided documents.",
+        "greeting": (
+            "Hi! 👋 I'm your document assistant. "
+            "Upload a file and ask me anything about it — I'm here to help!"
+        ),
+        "thanks": (
+            "You're welcome! Feel free to ask more questions about your documents."
+        ),
+        "farewell": (
+            "Goodbye! Come back anytime you need help with your documents. 👋"
+        ),
+        "no_docs": (
+            "Hi there! It looks like no documents have been uploaded yet. "
+            "Please upload a PDF or DOCX file first and I'll be ready to answer your questions."
+        ),
+        "out_of_scope": (
+            "I don't have information about this in the provided documents."
+        ),
     }
-    return responses.get(intent, "I'm here to help. Please ask a question about your uploaded documents.")
+    return responses.get(
+        intent,
+        "Hi! I'm here to help. Please ask a question about your uploaded documents."
+    )
