@@ -20,6 +20,7 @@ from minio import Minio
 
 from rag.indexer import build_index, load_documents
 from core.component import SLMComponent
+from core.bio_component import BioSLMComponent
 from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
 from model.domain_trainer import train_domain_lora
@@ -78,6 +79,10 @@ current_model = None
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ModeRequest(BaseModel):
     model: str
+class BioRagRequest(BaseModel):
+    model: str
+    chroma_path: str = "./chroma_db_final"
+    lora_path: Optional[str] = None
 
 
 class LoadAdapterRequest(BaseModel):
@@ -213,6 +218,39 @@ async def health():
         "timestamp":     datetime.datetime.utcnow().isoformat(),
     }
 
+
+# Add this endpoint
+@app.post("/node/bio-rag")
+async def bio_rag_node(req: BioRagRequest):
+    """
+    Load model in Bio-RAG mode using the pre-built DNA ChromaDB.
+    No document upload needed — ChromaDB is already indexed.
+    """
+    global slm_component, current_mode, current_model
+
+    _validate_model(req.model)
+    _unload_current_model()
+
+    try:
+        slm_component = await run_in_threadpool(
+            lambda: BioSLMComponent(
+                model_name=req.model,
+                chroma_path=req.chroma_path,
+                lora_path=req.lora_path,
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load Bio-RAG: {str(e)}")
+
+    current_mode  = "bio-rag"
+    current_model = req.model
+
+    return {
+        "node":        "bio-rag",
+        "status":      "ready",
+        "model":       req.model,
+        "chroma_path": req.chroma_path,
+    }
 
 @app.get("/models")
 async def list_models():
