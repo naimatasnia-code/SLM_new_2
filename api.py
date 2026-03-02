@@ -81,7 +81,7 @@ class ModeRequest(BaseModel):
     model: str
 class BioRagRequest(BaseModel):
     model: str
-    chroma_path: str = "./chroma_db_final"
+    chroma_path: str = "rag/chroma_db"
     lora_path: Optional[str] = None
 
 
