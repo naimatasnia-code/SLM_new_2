@@ -1,7 +1,7 @@
 # rag/bio_retriever.py
 
 import os
-from langchain.schema import Document
+from langchain_core.documents import Document
 from .rag_retriever import BioRAG
 
 
