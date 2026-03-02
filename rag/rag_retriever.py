@@ -2,21 +2,25 @@ import chromadb
 from chromadb.utils import embedding_functions
 import os
 
+import os
+import chromadb
+from chromadb.utils import embedding_functions
+
 class BioRAG:
-    def __init__(self, db_path="./chroma_db_final"):
-        """
-        initialize the Bio-RAG Retriever.
-        connects to the database created by vector_db_builder.py.
-        """
+    def __init__(self, db_path=None):
+        base_dir = os.path.dirname(__file__)   # /app/rag
+        if db_path is None:
+            db_path = os.path.join(base_dir, "chroma_db")  # /app/rag/chroma_db
+
         if not os.path.exists(db_path):
             raise FileNotFoundError(f"Database folder '{db_path}' not found.")
-            
+
         self.client = chromadb.PersistentClient(path=db_path)
         self.embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name="all-MiniLM-L6-v2"
         )
         self.collection = self.client.get_collection(
-            name="bio_rag_memory", 
+            name="bio_rag_memory",
             embedding_function=self.embedding_func
         )
 
