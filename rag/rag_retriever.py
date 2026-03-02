@@ -2,10 +2,6 @@ import chromadb
 from chromadb.utils import embedding_functions
 import os
 
-import os
-import chromadb
-from chromadb.utils import embedding_functions
-
 class BioRAG:
     def __init__(self, db_path=None):
         base_dir = os.path.dirname(__file__)   # /app/rag
