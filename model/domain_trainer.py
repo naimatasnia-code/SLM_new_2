@@ -1,16 +1,4 @@
-"""
-model/domain_trainer.py
-=======================
-Memory-safe LoRA fine-tuning for 4 GB CPU environments.
 
-Key optimizations:
-- gradient_checkpointing: recompute activations instead of storing → -40% RAM
-- max_length=128: half the sequence memory vs 256
-- gradient_accumulation_steps=4: effective batch=4 with batch_size=1
-- low_cpu_mem_usage=True: streams weights during load → lower peak RAM
-- del model + gc.collect() after training: self-destructs to free RAM
-- Hard blocks phi-2 on CPU (needs 6-7 GB, won't fit in 4 GB)
-"""
 
 import gc
 import torch
@@ -31,19 +19,53 @@ MODELS = {
 
 CPU_SAFE_MODELS = {"tinyllama", "qwen-0.5b"}
 
+# Valid optimizer names accepted by HuggingFace Trainer
+OPTIMIZER_MAP = {
+    "adam":     "adamw_torch",
+    "adamw":    "adamw_torch",
+    "sgd":      "sgd",
+    "rmsprop":  "rmsprop",
+    "adafactor": "adafactor",
+    "adamw_torch": "adamw_torch",
+}
+
 
 def train_domain_lora(
     model_name: str,
     dataset: Dataset,
     output_dir: str,
+    lora_params: dict = None,   # ← dynamic params from UI
 ) -> None:
     """
     Fine-tunes a LoRA adapter on the provided dataset.
     Saves only the adapter (not full model weights) to output_dir.
     Self-destructs after saving to free RAM for inference model reload.
 
+    Args:
+        model_name  : one of MODELS keys
+        dataset     : HuggingFace Dataset with a 'text' column
+        output_dir  : path to save the LoRA adapter
+        lora_params : dict of UI-supplied parameters (all optional, safe defaults used)
+
     Raises MemoryError if phi-2 is requested on CPU.
     """
+    # ── Defaults (safe for 4 GB CPU) ─────────────────────────────────────────
+    p = lora_params or {}
+
+    lora_rank      = int(p.get("lora_rank",      8))
+    lora_alpha     = int(p.get("lora_alpha",     16))
+    lora_dropout   = float(p.get("lora_dropout",  0.05))
+    target_modules = p.get("target_modules",     ["q_proj", "v_proj"])
+    learning_rate  = float(p.get("learning_rate", 2e-4))
+    batch_size     = int(p.get("batch_size",      1))
+    epochs         = int(p.get("epochs",          1))
+    grad_ckpt      = bool(p.get("gradient_checkpointing", True))
+
+    # Normalize optimizer name → HuggingFace key
+    raw_optim = str(p.get("optimizer", "adamw_torch")).lower()
+    optimizer = OPTIMIZER_MAP.get(raw_optim, "adamw_torch")
+
+    # ── Hardware check ────────────────────────────────────────────────────────
     has_gpu = torch.cuda.is_available()
 
     if not has_gpu and model_name not in CPU_SAFE_MODELS:
@@ -52,13 +74,24 @@ def train_domain_lora(
             f"Use 'tinyllama' or 'qwen-0.5b' for 4 GB environments."
         )
 
+    # Enforce minimum memory safety on CPU regardless of UI input
+    if not has_gpu:
+        batch_size = min(batch_size, 1)   # never exceed 1 on CPU
+        lora_rank  = min(lora_rank,  8)   # cap rank at 8 on CPU
+        grad_ckpt  = True                 # always on for CPU
+
     model_id = MODELS[model_name]
+
+    print(f"[trainer] LoRA config → rank={lora_rank}, alpha={lora_alpha}, "
+          f"dropout={lora_dropout}, modules={target_modules}")
+    print(f"[trainer] Training config → lr={learning_rate}, batch={batch_size}, "
+          f"epochs={epochs}, optimizer={optimizer}, grad_ckpt={grad_ckpt}")
 
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token     = tokenizer.eos_token
-        tokenizer.pad_token_id  = tokenizer.eos_token_id
+        tokenizer.pad_token    = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # ── Load model (RAM-safe) ─────────────────────────────────────────────────
     print(f"[trainer] Loading {model_name} for fine-tuning...")
@@ -69,23 +102,24 @@ def train_domain_lora(
         low_cpu_mem_usage=True,      # streams weights → lower peak RAM
     )
 
-    # ── LoRA config (minimal rank = tiny adapter, minimal extra RAM) ──────────
+    # ── LoRA config ───────────────────────────────────────────────────────────
     lora_cfg = LoraConfig(
-        r=2,                  # very small rank → tiny adapter footprint
-        lora_alpha=4,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.05,
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
 
-    # IMPORTANT: gradient checkpointing and enable_input_require_grads MUST be
+    # IMPORTANT: gradient_checkpointing and enable_input_require_grads MUST be
     # called AFTER get_peft_model(). get_peft_model() replaces the model object,
     # so any hooks set before it are lost and cause:
     #   "element 0 of tensors does not require grad and does not have a grad_fn"
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    if grad_ckpt:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
     model.print_trainable_parameters()
 
@@ -95,7 +129,7 @@ def train_domain_lora(
             x["text"],
             truncation=True,
             padding="max_length",
-            max_length=128,       # was 256 → halves sequence tensor memory
+            max_length=128,       # halves sequence tensor memory vs 256
         )
         out["labels"] = out["input_ids"].copy()
         return out
@@ -105,9 +139,11 @@ def train_domain_lora(
     # ── Training args ─────────────────────────────────────────────────────────
     args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=1,       # minimum memory per step
-        gradient_accumulation_steps=4,       # effective batch=4 without RAM cost
-        num_train_epochs=1,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=max(1, 4 // batch_size),  # keep effective batch ~4
+        num_train_epochs=epochs,
+        learning_rate=learning_rate,
+        optim=optimizer,
         logging_steps=10,
         save_strategy="epoch",
         report_to="none",
@@ -116,7 +152,6 @@ def train_domain_lora(
         bf16=False,
         dataloader_pin_memory=False,         # requires CUDA
         no_cuda=not has_gpu,
-        optim="adamw_torch",                 # lightweight standard optimizer
     )
 
     trainer = Trainer(
