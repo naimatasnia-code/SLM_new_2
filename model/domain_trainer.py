@@ -151,7 +151,7 @@ def train_domain_lora(
         fp16=False,                          # CPU does not support fp16 training
         bf16=False,
         dataloader_pin_memory=False,         # requires CUDA
-        no_cuda=not has_gpu,
+        use_cpu=not has_gpu
     )
 
     trainer = Trainer(
