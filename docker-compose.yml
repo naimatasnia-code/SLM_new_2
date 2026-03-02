@@ -1,0 +1,24 @@
+version: "3.7"
+services:
+  slm-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: slm-backend
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./uploads:/app/uploads
+      - ./vector_db:/app/vector_db
+      - ./adapters:/app/adapters
+      - ./chroma_db_final:/app/chroma_db_final
+      - ./data:/app/data
+    environment:
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+      - MINIO_API_HOST=192.168.1.10:9000
+      - ACCESS_KEY=minio
+      - SECRET_KEY=password
+      - NODE_STORAGE_REF=nodes_bucket
