@@ -25,6 +25,39 @@ from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
 from model.domain_trainer import train_domain_lora
 
+
+import tempfile
+import os, sys
+import logging
+
+LOGGING_DEFAULT_DICT = {
+    "version": 1,
+    "disable_existing_loggers": True,
+    "formatters": {
+        "detailed": {
+            "class": "logging.Formatter",
+            "format": '"[%(asctime)s] [%(levelname)s] [%(funcName)s():%(lineno)s] '
+                      '[PID:%(process)d TID:%(thread)d] %(message)s"',
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "DEBUG",
+            "formatter": "detailed",
+            "stream": sys.stdout,
+        },
+    },    
+    "loggers": {
+        "welcome.log":  {"level": "DEBUG", "handlers": ["console"], "propagate": False},
+    },
+    "root": {"level": "INFO", "handlers": ["console"]},
+}
+
+logging.config.dictConfig(LOGGING_DEFAULT_DICT)
+log = logging.getLogger("welcome.log")
+
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 UPLOAD_DIR   = "uploads"
 VECTOR_DIR   = "vector_db"
@@ -505,3 +538,29 @@ async def inference_node(req: QueryRequest):
 async def chat(req: QueryRequest):
     """Alias for /node/inference."""
     return await inference_node(req)
+
+
+# Upload Node
+@app.get("/node/uploadDocument")
+async def upload_document_by_minio(file_path: str):
+
+    log.debug(f"file uploaded {file_path}")
+    # Otherwise fetch PDF and run pipeline
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = os.path.join(tmpdir, "file.pdf")
+        try:
+            MINIO_CLIENT.fget_object(NODE_STORAGE_REF, file_path, tmp_path)
+            # Index inside upload (as requested)
+            await run_in_threadpool(build_index, [tmp_path], VECTOR_DIR)
+
+        except Exception:
+            # fallback
+            MINIO_CLIENT.fget_object(
+                NODE_STORAGE_REF,
+                f"test_input/{os.path.basename(tmp_path)}",
+                tmp_path,
+            )
+
+    
+    log.debug(f"file uploaded {file_path}")
+    return {"node": "upload", "status": "uploaded", "file": file_path}
