@@ -1,5 +1,3 @@
-
-
 import gc
 import os
 import re
@@ -8,6 +6,7 @@ import json
 import shutil
 import asyncio
 import datetime
+import traceback
 
 import torch
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -29,6 +28,7 @@ from model.domain_trainer import train_domain_lora
 import tempfile
 import os, sys
 import logging
+import logging.config
 
 LOGGING_DEFAULT_DICT = {
     "version": 1,
@@ -47,9 +47,9 @@ LOGGING_DEFAULT_DICT = {
             "formatter": "detailed",
             "stream": sys.stdout,
         },
-    },    
+    },
     "loggers": {
-        "welcome.log":  {"level": "DEBUG", "handlers": ["console"], "propagate": False},
+        "welcome.log": {"level": "DEBUG", "handlers": ["console"], "propagate": False},
     },
     "root": {"level": "INFO", "handlers": ["console"]},
 }
@@ -62,7 +62,7 @@ log = logging.getLogger("welcome.log")
 UPLOAD_DIR   = "uploads"
 VECTOR_DIR   = "vector_db"
 DATASET_PATH = "data/train.jsonl"
-ADAPTERS_DIR = "adapters"          # root folder for all saved adapters
+ADAPTERS_DIR = "adapters"
 
 os.makedirs("data",       exist_ok=True)
 os.makedirs(UPLOAD_DIR,   exist_ok=True)
@@ -112,55 +112,47 @@ current_model = None
 # ── Schemas ───────────────────────────────────────────────────────────────────
 class ModeRequest(BaseModel):
     model: str
+
 class BioRagRequest(BaseModel):
     model: str
     chroma_path: str = "rag/chroma_db"
     lora_path: Optional[str] = None
 
-
 class LoadAdapterRequest(BaseModel):
     model: str
     adapter_path: str
 
-
 class FineTuneRequest(BaseModel):
-    # Base model
     model: str
 
-    # Customization mode
     customization_type: str = Field(
         default="LoRA",
         description="One of: 'LoRA', 'RAG', 'Both'"
     )
 
-    # Dataset generation
     samples_per_chunk: int = Field(default=2, ge=1, le=10)
 
-    # LoRA hyperparameters (all have safe defaults)
-    lora_rank: int         = Field(default=8,    ge=2,   le=64)
-    lora_alpha: int        = Field(default=16,   ge=1,   le=128)
-    lora_dropout: float    = Field(default=0.05, ge=0.0, le=0.2)
+    lora_rank: int            = Field(default=8,    ge=2,   le=64)
+    lora_alpha: int           = Field(default=16,   ge=1,   le=128)
+    lora_dropout: float       = Field(default=0.05, ge=0.0, le=0.2)
     target_modules: List[str] = Field(
         default=["q_proj", "v_proj"],
         description="Which transformer layers get LoRA adapters"
     )
 
-    # Training hyperparameters
-    learning_rate: float   = Field(default=2e-4,  gt=0)
-    batch_size: int        = Field(default=1,      ge=1, le=8)
-    epochs: int            = Field(default=1,      ge=1, le=10)
-    optimizer: str         = Field(default="adamw_torch")
+    learning_rate: float  = Field(default=2e-4, gt=0)
+    batch_size: int       = Field(default=1,    ge=1, le=8)
+    epochs: int           = Field(default=1,    ge=1, le=10)
+    optimizer: str        = Field(default="adamw_torch")
     gradient_checkpointing: bool = Field(default=True)
 
-    # Output
-    model_name: str        = Field(default="")
-    model_version: str     = Field(default="v1.0")
+    model_name: str            = Field(default="")
+    model_version: str         = Field(default="v1.0")
     output_path: Optional[str] = Field(default=None)
 
 
 class QueryRequest(BaseModel):
     question: str
-
 
 class QueryResponse(BaseModel):
     answer:            str
@@ -190,24 +182,53 @@ def _validate_model(model_name: str) -> None:
 
 
 def _unload_current_model() -> None:
+    """Unload whatever model is in RAM and aggressively free memory."""
     global slm_component
     if slm_component is not None:
         print("[api] Unloading current model...")
         del slm_component
         slm_component = None
+        # FIX: double gc.collect() pass to ensure cyclic refs are cleared
+        gc.collect()
         gc.collect()
         if HAS_GPU:
             torch.cuda.empty_cache()
         print("[api] Model unloaded. RAM freed.")
+    else:
+        # Even if nothing was loaded, clean up any stray tensors
+        gc.collect()
+        if HAS_GPU:
+            torch.cuda.empty_cache()
 
 
 def _adapter_dir(req: FineTuneRequest) -> str:
-    """Build a unique directory name for a trained adapter."""
+    """
+    Build a unique subdirectory path for a trained adapter.
+
+    FIX: Previously, empty model_name + model_version could resolve to just
+    ADAPTERS_DIR (e.g. 'adapters/') instead of a subdirectory, causing
+    save_pretrained to write adapter_config.json at the root adapters/ level
+    and crash on subsequent runs.
+
+    Now we always guarantee a non-empty subfolder name.
+    """
+    # Explicit output_path must still be a subdirectory of ADAPTERS_DIR
     if req.output_path:
-        return req.output_path
+        path = req.output_path
+        # Safety: if caller passed just "adapters" or the root dir, append model name
+        if os.path.normpath(path) == os.path.normpath(ADAPTERS_DIR):
+            safe_name = re.sub(r"[^\w\-]", "_", req.model_name or req.model)
+            safe_ver  = re.sub(r"[^\w\-]", "_", req.model_version or "v1")
+            path = os.path.join(ADAPTERS_DIR, f"{safe_name}_{safe_ver}")
+        return path
+
     safe_name = re.sub(r"[^\w\-]", "_", req.model_name or req.model)
-    safe_ver  = re.sub(r"[^\w\-]", "_", req.model_version)
-    return os.path.join(ADAPTERS_DIR, f"{safe_name}_{safe_ver}")
+    safe_ver  = re.sub(r"[^\w\-]", "_", req.model_version or "v1")
+
+    # Strip leading/trailing underscores and guarantee non-empty
+    folder = f"{safe_name}_{safe_ver}".strip("_") or f"{req.model}_adapter"
+
+    return os.path.join(ADAPTERS_DIR, folder)
 
 
 def _list_saved_adapters() -> list:
@@ -252,12 +273,10 @@ async def health():
     }
 
 
-# Add this endpoint
 @app.post("/node/bio-rag")
 async def bio_rag_node(req: BioRagRequest):
     """
     Load model in Bio-RAG mode using the pre-built DNA ChromaDB.
-    No document upload needed — ChromaDB is already indexed.
     """
     global slm_component, current_mode, current_model
 
@@ -273,7 +292,7 @@ async def bio_rag_node(req: BioRagRequest):
             )
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load Bio-RAG: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to load Bio-RAG: {traceback.format_exc()}")
 
     current_mode  = "bio-rag"
     current_model = req.model
@@ -285,25 +304,18 @@ async def bio_rag_node(req: BioRagRequest):
         "chroma_path": req.chroma_path,
     }
 
+
 @app.get("/models")
 async def list_models():
-    """
-    Returns all available base models with memory requirements.
-    The UI uses this to populate the model selection dropdown.
-    """
     return {
-        "models":        MODEL_CATALOG,
+        "models":      MODEL_CATALOG,
         "gpu_available": HAS_GPU,
-        "recommended":   [m["id"] for m in MODEL_CATALOG if m["cpu_safe"] or HAS_GPU],
+        "recommended": [m["id"] for m in MODEL_CATALOG if m["cpu_safe"] or HAS_GPU],
     }
 
 
 @app.get("/adapters")
 async def list_adapters():
-    """
-    Returns all previously trained LoRA adapters saved on disk.
-    Used by Loop Orchestra to let users pick a customized model.
-    """
     adapters = _list_saved_adapters()
     return {
         "adapters": adapters,
@@ -354,6 +366,18 @@ async def finetune_node(req: FineTuneRequest):
 
     _validate_model(req.model)
 
+    # ── FIX: Log free RAM at start so memory issues are visible in logs ────────
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        print(
+            f"[api] RAM before finetune → "
+            f"free={round(mem.available / 1e9, 2)} GB / "
+            f"total={round(mem.total / 1e9, 2)} GB"
+        )
+    except Exception:
+        pass
+
     # ── RAG-only shortcut (no training needed) ────────────────────────────────
     if req.customization_type == "RAG":
         _unload_current_model()
@@ -371,7 +395,7 @@ async def finetune_node(req: FineTuneRequest):
 
     # ── LoRA / Both path ──────────────────────────────────────────────────────
 
-    # Step 1: free RAM
+    # Step 1: free RAM before loading training model
     _unload_current_model()
 
     # Step 2: collect uploaded files
@@ -399,9 +423,9 @@ async def finetune_node(req: FineTuneRequest):
         build_domain_dataset,
         docs,
         DATASET_PATH,
-        80,                     # min_chunk_len
+        80,
         req.samples_per_chunk,
-        0.15,                   # negative_ratio
+        0.15,
     )
     if n_samples == 0:
         raise HTTPException(
@@ -414,7 +438,7 @@ async def finetune_node(req: FineTuneRequest):
         data = [json.loads(line) for line in f if line.strip()]
     dataset = Dataset.from_list(data)
 
-    # Step 5: build LoRA params dict from request
+    # Step 5: build LoRA params dict
     lora_params = {
         "lora_rank":              req.lora_rank,
         "lora_alpha":             req.lora_alpha,
@@ -427,22 +451,24 @@ async def finetune_node(req: FineTuneRequest):
         "gradient_checkpointing": req.gradient_checkpointing,
     }
 
-    # Step 6: determine output directory
+    # Step 6: determine output directory (FIX: always a proper subdirectory)
     lora_dir = _adapter_dir(req)
     os.makedirs(lora_dir, exist_ok=True)
     print(f"[api] Adapter will be saved → {lora_dir}")
 
     # Step 7: train LoRA adapter
-    # domain_trainer loads model → trains → saves → self-destructs (RAM freed)
+    # FIX: Full traceback is now returned in the 500 detail for easier debugging
     try:
         await run_in_threadpool(train_domain_lora, req.model, dataset, lora_dir, lora_params)
     except MemoryError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Training failed:\n{traceback.format_exc()}",
+        )
 
     # Step 8: reload inference model with adapter
-    # RAM is free now (trainer self-destructed in Step 7)
     try:
         slm_component = await run_in_threadpool(
             lambda: DomainSLMComponent(req.model, VECTOR_DIR, lora_dir)
@@ -450,7 +476,7 @@ async def finetune_node(req: FineTuneRequest):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Fine-tune succeeded but failed to reload model: {str(e)}",
+            detail=f"Fine-tune succeeded but failed to reload model:\n{traceback.format_exc()}",
         )
 
     current_mode  = "finetune"
@@ -473,7 +499,6 @@ async def finetune_node(req: FineTuneRequest):
 async def load_adapter_node(req: LoadAdapterRequest):
     """
     Load a previously saved LoRA adapter by path.
-    Used by Loop Orchestra to switch between customized models.
     """
     global slm_component, current_mode, current_model
 
@@ -488,7 +513,7 @@ async def load_adapter_node(req: LoadAdapterRequest):
     if not os.path.exists(cfg_path):
         raise HTTPException(
             status_code=400,
-            detail=f"Path exists but is not a valid LoRA adapter (missing adapter_config.json).",
+            detail="Path exists but is not a valid LoRA adapter (missing adapter_config.json).",
         )
 
     _unload_current_model()
@@ -500,7 +525,7 @@ async def load_adapter_node(req: LoadAdapterRequest):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to load adapter: {str(e)}",
+            detail=f"Failed to load adapter:\n{traceback.format_exc()}",
         )
 
     current_mode  = "finetune"
@@ -540,27 +565,20 @@ async def chat(req: QueryRequest):
     return await inference_node(req)
 
 
-# Upload Node
 @app.get("/node/uploadDocument")
 async def upload_document_by_minio(file_path: str):
-
     log.debug(f"file uploaded {file_path}")
-    # Otherwise fetch PDF and run pipeline
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = os.path.join(tmpdir, "file.pdf")
         try:
             MINIO_CLIENT.fget_object(NODE_STORAGE_REF, file_path, tmp_path)
-            # Index inside upload (as requested)
             await run_in_threadpool(build_index, [tmp_path], VECTOR_DIR)
-
         except Exception:
-            # fallback
             MINIO_CLIENT.fget_object(
                 NODE_STORAGE_REF,
                 f"test_input/{os.path.basename(tmp_path)}",
                 tmp_path,
             )
 
-    
     log.debug(f"file uploaded {file_path}")
     return {"node": "upload", "status": "uploaded", "file": file_path}
