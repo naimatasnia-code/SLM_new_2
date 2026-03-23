@@ -1,5 +1,4 @@
-
-
+import gc
 import torch
 from transformers import (
     AutoTokenizer,
@@ -23,6 +22,12 @@ def load_slm(
     lora_path: str | None = None,
     quantized: bool = True,
 ):
+    # ── FIX 1: Clean memory before loading inference model ────────────────────
+    # Prevents leftover training tensors from causing OOM during inference load.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     torch.set_grad_enabled(False)    # global grad off → saves ~30 % RAM
 
     model_id = MODELS[model_name]
@@ -40,7 +45,7 @@ def load_slm(
     # ── Tokenizer ─────────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # ── Quantization config (GPU only) ────────────────────────────────────────
@@ -54,6 +59,7 @@ def load_slm(
         )
 
     # ── Model load ────────────────────────────────────────────────────────────
+    print(f"[slm_loader] Loading {model_name} for inference...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         device_map="auto" if has_gpu else None,
@@ -63,7 +69,9 @@ def load_slm(
     )
 
     if lora_path:
+        print(f"[slm_loader] Loading LoRA adapter from {lora_path} ...")
         model = PeftModel.from_pretrained(model, lora_path)
 
     model.eval()
+    print(f"[slm_loader] {model_name} ready.")
     return tokenizer, model
