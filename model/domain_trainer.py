@@ -17,7 +17,6 @@ MODELS = {
 
 CPU_SAFE_MODELS = {"tinyllama", "qwen-0.5b"}
 
-# Valid optimizer names accepted by HuggingFace Trainer
 OPTIMIZER_MAP = {
     "adam":        "adamw_torch",
     "adamw":       "adamw_torch",
@@ -26,6 +25,21 @@ OPTIMIZER_MAP = {
     "adafactor":   "adafactor",
     "adamw_torch": "adamw_torch",
 }
+
+
+def _make_inputs_require_grad(module, input, output):
+    """
+    Forward hook attached to the embedding layer.
+    Forces the output tensor to require gradients so that
+    gradient checkpointing does not sever the computation graph.
+
+    This is the correct fix for:
+      RuntimeError: element 0 of tensors does not require grad
+                    and does not have a grad_fn
+    which occurs when gradient_checkpointing_enable() is called
+    alongside LoRA on CPU (no autocast, pure float32).
+    """
+    output.requires_grad_(True)
 
 
 def train_domain_lora(
@@ -48,15 +62,13 @@ def train_domain_lora(
     Raises MemoryError if phi-2 is requested on CPU.
     """
 
-    # ── FIX 1: Aggressive memory cleanup BEFORE anything else ─────────────────
-    # This ensures any previously loaded inference model or leftover tensors
-    # are fully cleared before we attempt to load the (heavier) training model.
+    # ── Pre-training memory cleanup ───────────────────────────────────────────
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print("[trainer] Pre-training memory cleanup done.")
 
-    # ── Defaults (safe for 4 GB CPU) ─────────────────────────────────────────
+    # ── Defaults ──────────────────────────────────────────────────────────────
     p = lora_params or {}
 
     lora_rank      = int(p.get("lora_rank",      8))
@@ -68,7 +80,6 @@ def train_domain_lora(
     epochs         = int(p.get("epochs",          1))
     grad_ckpt      = bool(p.get("gradient_checkpointing", True))
 
-    # Normalize optimizer name → HuggingFace key
     raw_optim = str(p.get("optimizer", "adamw_torch")).lower()
     optimizer = OPTIMIZER_MAP.get(raw_optim, "adamw_torch")
 
@@ -81,14 +92,12 @@ def train_domain_lora(
             f"Use 'tinyllama' or 'qwen-0.5b' for 4 GB environments."
         )
 
-    # ── FIX 2: Stricter CPU memory safety caps ────────────────────────────────
-    # On CPU float32, every extra rank unit and sequence length costs real RAM.
-    # These hard caps prevent OOM before trainer.train() is even reached.
+    # ── CPU safety caps ───────────────────────────────────────────────────────
     if not has_gpu:
-        batch_size = min(batch_size, 1)    # never exceed 1 on CPU
-        lora_rank  = min(lora_rank,  4)    # FIX: capped to 4 (was 8) → saves ~200 MB
-        epochs     = min(epochs,     1)    # FIX: cap epochs to 1 on CPU
-        grad_ckpt  = True                  # always on for CPU
+        batch_size = min(batch_size, 1)
+        lora_rank  = min(lora_rank,  4)
+        epochs     = min(epochs,     1)
+        grad_ckpt  = True
         print(
             f"[trainer] CPU mode: enforced caps → "
             f"batch=1, lora_rank={lora_rank}, epochs=1, grad_ckpt=True"
@@ -107,16 +116,16 @@ def train_domain_lora(
         tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # ── Load model (RAM-safe) ─────────────────────────────────────────────────
+    # ── Load base model ───────────────────────────────────────────────────────
     print(f"[trainer] Loading {model_name} for fine-tuning...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float32,   # CPU requires float32
-        device_map=None,             # keep on CPU
-        low_cpu_mem_usage=True,      # streams weights → lower peak RAM
+        torch_dtype=torch.float32,
+        device_map=None,
+        low_cpu_mem_usage=True,
     )
 
-    # ── LoRA config ───────────────────────────────────────────────────────────
+    # ── Apply LoRA ────────────────────────────────────────────────────────────
     lora_cfg = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
@@ -127,19 +136,40 @@ def train_domain_lora(
     )
     model = get_peft_model(model, lora_cfg)
 
-    # IMPORTANT: gradient_checkpointing and enable_input_require_grads MUST be
-    # called AFTER get_peft_model(). get_peft_model() replaces the model object,
-    # so any hooks set before it are lost and cause:
-    #   "element 0 of tensors does not require grad and does not have a grad_fn"
+    # ── Gradient checkpointing setup (THE KEY FIX) ────────────────────────────
+    # Problem:  gradient_checkpointing_enable() + LoRA on CPU severs the
+    #           autograd graph at the embedding boundary, causing:
+    #           "element 0 of tensors does not require grad and does not have a grad_fn"
+    #
+    # Wrong fix: model.enable_input_require_grads() — unreliable on some
+    #            transformers versions with pure float32 / no autocast.
+    #
+    # Correct fix: register a forward hook directly on the embedding layer that
+    #              calls requires_grad_(True) on its output every forward pass.
+    #              This is version-agnostic and works on CPU and GPU.
     if grad_ckpt:
         model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+
+        # Find embedding layer — covers LLaMA, Qwen, Phi, Mistral, Falcon, etc.
+        embedding_layer = None
+        for name, module in model.named_modules():
+            if "embed_tokens" in name or "embedding" in name.lower():
+                embedding_layer = module
+                break
+
+        if embedding_layer is not None:
+            embedding_layer.register_forward_hook(_make_inputs_require_grad)
+            print("[trainer] Gradient hook attached to embedding layer.")
+        else:
+            # Fallback for architectures with non-standard embedding names
+            model.enable_input_require_grads()
+            print("[trainer] Fallback: enable_input_require_grads() used.")
 
     model.print_trainable_parameters()
 
-    # ── FIX 3: Tokenize with max_length=64 on CPU (was 128) ──────────────────
-    # Halving sequence length cuts activation tensor memory by ~4x during
-    # backprop (activations scale quadratically with sequence length).
+    # ── Tokenize ──────────────────────────────────────────────────────────────
+    # max_length=64 on CPU: activation memory scales quadratically with
+    # sequence length, halving it saves ~4x backprop RAM.
     max_seq_len = 128 if has_gpu else 64
 
     def tokenize(x):
@@ -159,7 +189,7 @@ def train_domain_lora(
     args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=max(1, 4 // batch_size),  # keep effective batch ~4
+        gradient_accumulation_steps=max(1, 4 // batch_size),
         num_train_epochs=epochs,
         learning_rate=learning_rate,
         optim=optimizer,
@@ -167,9 +197,9 @@ def train_domain_lora(
         save_strategy="epoch",
         report_to="none",
         remove_unused_columns=False,
-        fp16=False,                          # CPU does not support fp16 training
+        fp16=False,
         bf16=False,
-        dataloader_pin_memory=False,         # requires CUDA
+        dataloader_pin_memory=False,
         use_cpu=not has_gpu,
     )
 
@@ -188,7 +218,7 @@ def train_domain_lora(
     tokenizer.save_pretrained(output_dir)
     print(f"[trainer] LoRA adapter saved → {output_dir}")
 
-    # ── Self-destruct to free RAM ─────────────────────────────────────────────
+    # ── Free RAM ──────────────────────────────────────────────────────────────
     del trainer
     del model
     gc.collect()
