@@ -1,5 +1,3 @@
-
-
 import json
 import os
 import re
@@ -77,7 +75,7 @@ def _make_prompt(context: str, question: str, answer: str) -> str:
 
 
 def build_domain_dataset(
-    docs: list,          # list of LangChain Document objects (page_content + metadata)
+    docs: list,
     output_path: str,
     min_chunk_len: int = 80,
     samples_per_chunk: int = 2,
@@ -107,7 +105,7 @@ def build_domain_dataset(
         if len(chunk) < min_chunk_len:
             continue   # skip noise chunks
 
-        topic = _extract_topic(chunk)
+        topic  = _extract_topic(chunk)
         answer = _clean_answer(chunk)
 
         # Generate factual question variants for this chunk
@@ -121,11 +119,10 @@ def build_domain_dataset(
             })
 
     # ── Negative samples (out-of-scope boundary teaching) ─────────────────────
-    # Use the first real chunk as context (model must learn to ignore it for OOS)
     if docs:
         anchor_chunk = docs[0].page_content.strip()[:400]
-        n_negatives = max(1, int(len(samples) * negative_ratio))
-        neg_topics = random.choices(_NEGATIVE_TOPICS, k=n_negatives)
+        n_negatives  = max(1, int(len(samples) * negative_ratio))
+        neg_topics   = random.choices(_NEGATIVE_TOPICS, k=n_negatives)
         for t in neg_topics:
             question = f"What is {t}?"
             samples.append({
