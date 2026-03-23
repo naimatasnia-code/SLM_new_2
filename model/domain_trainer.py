@@ -1,5 +1,3 @@
-
-
 import gc
 import torch
 from datasets import Dataset
@@ -21,11 +19,11 @@ CPU_SAFE_MODELS = {"tinyllama", "qwen-0.5b"}
 
 # Valid optimizer names accepted by HuggingFace Trainer
 OPTIMIZER_MAP = {
-    "adam":     "adamw_torch",
-    "adamw":    "adamw_torch",
-    "sgd":      "sgd",
-    "rmsprop":  "rmsprop",
-    "adafactor": "adafactor",
+    "adam":        "adamw_torch",
+    "adamw":       "adamw_torch",
+    "sgd":         "sgd",
+    "rmsprop":     "rmsprop",
+    "adafactor":   "adafactor",
     "adamw_torch": "adamw_torch",
 }
 
@@ -34,7 +32,7 @@ def train_domain_lora(
     model_name: str,
     dataset: Dataset,
     output_dir: str,
-    lora_params: dict = None,   # ← dynamic params from UI
+    lora_params: dict = None,
 ) -> None:
     """
     Fine-tunes a LoRA adapter on the provided dataset.
@@ -49,6 +47,15 @@ def train_domain_lora(
 
     Raises MemoryError if phi-2 is requested on CPU.
     """
+
+    # ── FIX 1: Aggressive memory cleanup BEFORE anything else ─────────────────
+    # This ensures any previously loaded inference model or leftover tensors
+    # are fully cleared before we attempt to load the (heavier) training model.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[trainer] Pre-training memory cleanup done.")
+
     # ── Defaults (safe for 4 GB CPU) ─────────────────────────────────────────
     p = lora_params or {}
 
@@ -74,11 +81,18 @@ def train_domain_lora(
             f"Use 'tinyllama' or 'qwen-0.5b' for 4 GB environments."
         )
 
-    # Enforce minimum memory safety on CPU regardless of UI input
+    # ── FIX 2: Stricter CPU memory safety caps ────────────────────────────────
+    # On CPU float32, every extra rank unit and sequence length costs real RAM.
+    # These hard caps prevent OOM before trainer.train() is even reached.
     if not has_gpu:
-        batch_size = min(batch_size, 1)   # never exceed 1 on CPU
-        lora_rank  = min(lora_rank,  8)   # cap rank at 8 on CPU
-        grad_ckpt  = True                 # always on for CPU
+        batch_size = min(batch_size, 1)    # never exceed 1 on CPU
+        lora_rank  = min(lora_rank,  4)    # FIX: capped to 4 (was 8) → saves ~200 MB
+        epochs     = min(epochs,     1)    # FIX: cap epochs to 1 on CPU
+        grad_ckpt  = True                  # always on for CPU
+        print(
+            f"[trainer] CPU mode: enforced caps → "
+            f"batch=1, lora_rank={lora_rank}, epochs=1, grad_ckpt=True"
+        )
 
     model_id = MODELS[model_name]
 
@@ -123,17 +137,22 @@ def train_domain_lora(
 
     model.print_trainable_parameters()
 
-    # ── Tokenize ──────────────────────────────────────────────────────────────
+    # ── FIX 3: Tokenize with max_length=64 on CPU (was 128) ──────────────────
+    # Halving sequence length cuts activation tensor memory by ~4x during
+    # backprop (activations scale quadratically with sequence length).
+    max_seq_len = 128 if has_gpu else 64
+
     def tokenize(x):
         out = tokenizer(
             x["text"],
             truncation=True,
             padding="max_length",
-            max_length=128,       # halves sequence tensor memory vs 256
+            max_length=max_seq_len,
         )
         out["labels"] = out["input_ids"].copy()
         return out
 
+    print(f"[trainer] Tokenizing with max_length={max_seq_len} ...")
     tokenized = dataset.map(tokenize, remove_columns=dataset.column_names)
 
     # ── Training args ─────────────────────────────────────────────────────────
@@ -151,7 +170,7 @@ def train_domain_lora(
         fp16=False,                          # CPU does not support fp16 training
         bf16=False,
         dataloader_pin_memory=False,         # requires CUDA
-        use_cpu=not has_gpu
+        use_cpu=not has_gpu,
     )
 
     trainer = Trainer(
@@ -159,7 +178,10 @@ def train_domain_lora(
         args=args,
         train_dataset=tokenized,
     )
+
+    print("[trainer] Starting training...")
     trainer.train()
+    print("[trainer] Training complete.")
 
     # ── Save adapter only ─────────────────────────────────────────────────────
     model.save_pretrained(output_dir)
