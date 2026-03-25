@@ -16,8 +16,8 @@ services:
       - ./chroma_db_final:/app/chroma_db_final
       - ./data:/app/data
     environment:
-      - TRANSFORMERS_OFFLINE=1
-      - HF_DATASETS_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=0
+      - HF_DATASETS_OFFLINE=0
       - MINIO_API_HOST=192.168.1.10:9000
       - ACCESS_KEY=minio
       - SECRET_KEY=password
