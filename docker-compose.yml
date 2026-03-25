@@ -9,7 +9,7 @@ services:
     ports:
       - "8007:8000"
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - /home/data/models:/root/.cache/huggingface
       - ./uploads:/app/uploads
       - ./vector_db:/app/vector_db
       - ./adapters:/app/adapters
