@@ -7,7 +7,7 @@ services:
     container_name: slm-backend
     restart: always
     ports:
-      - "8000:8000"
+      - "8007:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ./uploads:/app/uploads
