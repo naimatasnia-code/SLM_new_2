@@ -24,7 +24,6 @@ from core.domain_component import DomainSLMComponent
 from data.doc_to_dataset import build_domain_dataset
 from model.domain_trainer import train_domain_lora
 
-
 import tempfile
 import os, sys
 import logging
@@ -121,23 +120,15 @@ class BioRagRequest(BaseModel):
 class LoadAdapterRequest(BaseModel):
     model: str
     adapter_path: str
-    mode: str = "generic"
-
-# in load_adapter_node:
-slm_component = await run_in_threadpool(
-    lambda: DomainSLMComponent(req.model, VECTOR_DIR, req.adapter_path, req.mode)  # pass mode
-)
+    mode: str = "generic"          # ← "derma" for dermatology adapter
 
 class FineTuneRequest(BaseModel):
     model: str
-
     customization_type: str = Field(
         default="LoRA",
         description="One of: 'LoRA', 'RAG', 'Both'"
     )
-
     samples_per_chunk: int = Field(default=2, ge=1, le=10)
-
     lora_rank: int            = Field(default=8,    ge=2,   le=64)
     lora_alpha: int           = Field(default=16,   ge=1,   le=128)
     lora_dropout: float       = Field(default=0.05, ge=0.0, le=0.2)
@@ -145,13 +136,11 @@ class FineTuneRequest(BaseModel):
         default=["q_proj", "v_proj"],
         description="Which transformer layers get LoRA adapters"
     )
-
     learning_rate: float  = Field(default=2e-4, gt=0)
     batch_size: int       = Field(default=1,    ge=1, le=8)
     epochs: int           = Field(default=1,    ge=1, le=10)
     optimizer: str        = Field(default="adamw_torch")
     gradient_checkpointing: bool = Field(default=True)
-
     model_name: str            = Field(default="")
     model_version: str         = Field(default="v1.0")
     output_path: Optional[str] = Field(default=None)
@@ -188,40 +177,25 @@ def _validate_model(model_name: str) -> None:
 
 
 def _unload_current_model() -> None:
-    """Unload whatever model is in RAM and aggressively free memory."""
     global slm_component
     if slm_component is not None:
         print("[api] Unloading current model...")
         del slm_component
         slm_component = None
-        # FIX: double gc.collect() pass to ensure cyclic refs are cleared
         gc.collect()
         gc.collect()
         if HAS_GPU:
             torch.cuda.empty_cache()
         print("[api] Model unloaded. RAM freed.")
     else:
-        # Even if nothing was loaded, clean up any stray tensors
         gc.collect()
         if HAS_GPU:
             torch.cuda.empty_cache()
 
 
 def _adapter_dir(req: FineTuneRequest) -> str:
-    """
-    Build a unique subdirectory path for a trained adapter.
-
-    FIX: Previously, empty model_name + model_version could resolve to just
-    ADAPTERS_DIR (e.g. 'adapters/') instead of a subdirectory, causing
-    save_pretrained to write adapter_config.json at the root adapters/ level
-    and crash on subsequent runs.
-
-    Now we always guarantee a non-empty subfolder name.
-    """
-    # Explicit output_path must still be a subdirectory of ADAPTERS_DIR
     if req.output_path:
         path = req.output_path
-        # Safety: if caller passed just "adapters" or the root dir, append model name
         if os.path.normpath(path) == os.path.normpath(ADAPTERS_DIR):
             safe_name = re.sub(r"[^\w\-]", "_", req.model_name or req.model)
             safe_ver  = re.sub(r"[^\w\-]", "_", req.model_version or "v1")
@@ -230,15 +204,11 @@ def _adapter_dir(req: FineTuneRequest) -> str:
 
     safe_name = re.sub(r"[^\w\-]", "_", req.model_name or req.model)
     safe_ver  = re.sub(r"[^\w\-]", "_", req.model_version or "v1")
-
-    # Strip leading/trailing underscores and guarantee non-empty
     folder = f"{safe_name}_{safe_ver}".strip("_") or f"{req.model}_adapter"
-
     return os.path.join(ADAPTERS_DIR, folder)
 
 
 def _list_saved_adapters() -> list:
-    """Scan ADAPTERS_DIR for valid LoRA adapters."""
     adapters = []
     if not os.path.isdir(ADAPTERS_DIR):
         return adapters
@@ -281,9 +251,6 @@ async def health():
 
 @app.post("/node/bio-rag")
 async def bio_rag_node(req: BioRagRequest):
-    """
-    Load model in Bio-RAG mode using the pre-built DNA ChromaDB.
-    """
     global slm_component, current_mode, current_model
 
     _validate_model(req.model)
@@ -314,9 +281,9 @@ async def bio_rag_node(req: BioRagRequest):
 @app.get("/models")
 async def list_models():
     return {
-        "models":      MODEL_CATALOG,
+        "models":        MODEL_CATALOG,
         "gpu_available": HAS_GPU,
-        "recommended": [m["id"] for m in MODEL_CATALOG if m["cpu_safe"] or HAS_GPU],
+        "recommended":   [m["id"] for m in MODEL_CATALOG if m["cpu_safe"] or HAS_GPU],
     }
 
 
@@ -331,20 +298,12 @@ async def list_adapters():
 
 @app.post("/node/upload")
 async def upload_document(files: List[UploadFile] = File(...)):
-    """
-    Upload one or more PDF or DOCX files and index them all into the vector DB.
-
-    Send multiple files in a single request using repeated 'files' form fields:
-      files = doc1.pdf
-      files = doc2.pdf
-      files = doc3.docx
-    """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
-    saved_paths = []
+    saved_paths    = []
     uploaded_names = []
-    skipped = []
+    skipped        = []
 
     for file in files:
         ext = os.path.splitext(file.filename or "")[1].lower()
@@ -363,21 +322,19 @@ async def upload_document(files: List[UploadFile] = File(...)):
             detail=f"No valid files to index. Only PDF and DOCX are supported. Skipped: {skipped}",
         )
 
-    # Index all files in one pass — more efficient than one-by-one
     await run_in_threadpool(build_index, saved_paths, VECTOR_DIR)
 
     return {
-        "node":     "upload",
-        "status":   "indexed",
-        "files":    uploaded_names,
-        "count":    len(uploaded_names),
-        "skipped":  skipped,
+        "node":    "upload",
+        "status":  "indexed",
+        "files":   uploaded_names,
+        "count":   len(uploaded_names),
+        "skipped": skipped,
     }
 
 
 @app.post("/node/rag")
 async def rag_node(req: ModeRequest):
-    """Load model in RAG-only mode (no fine-tuning)."""
     global slm_component, current_mode, current_model
 
     _validate_model(req.model)
@@ -393,22 +350,10 @@ async def rag_node(req: ModeRequest):
 
 @app.post("/node/finetune")
 async def finetune_node(req: FineTuneRequest):
-    """
-    Fine-tune a LoRA adapter on uploaded documents, then reload in inference mode.
-
-    Customization types:
-      - RAG  : no training, just load model with vector DB
-      - LoRA : fine-tune adapter, reload with adapter
-      - Both : fine-tune adapter, reload with adapter + RAG
-
-    Prerequisites:
-      - Upload at least one document via POST /node/upload first.
-    """
     global slm_component, current_mode, current_model
 
     _validate_model(req.model)
 
-    # ── FIX: Log free RAM at start so memory issues are visible in logs ────────
     try:
         import psutil
         mem = psutil.virtual_memory()
@@ -420,7 +365,6 @@ async def finetune_node(req: FineTuneRequest):
     except Exception:
         pass
 
-    # ── RAG-only shortcut (no training needed) ────────────────────────────────
     if req.customization_type == "RAG":
         _unload_current_model()
         slm_component = await run_in_threadpool(
@@ -435,12 +379,8 @@ async def finetune_node(req: FineTuneRequest):
             "model":  req.model,
         }
 
-    # ── LoRA / Both path ──────────────────────────────────────────────────────
-
-    # Step 1: free RAM before loading training model
     _unload_current_model()
 
-    # Step 2: collect uploaded files
     file_paths = [
         os.path.join(UPLOAD_DIR, f)
         for f in os.listdir(UPLOAD_DIR)
@@ -452,7 +392,6 @@ async def finetune_node(req: FineTuneRequest):
             detail="No documents found. Upload at least one PDF or DOCX via /node/upload first.",
         )
 
-    # Step 3: load document text
     docs = await run_in_threadpool(load_documents, file_paths)
     if not docs:
         raise HTTPException(
@@ -460,14 +399,8 @@ async def finetune_node(req: FineTuneRequest):
             detail="Could not extract text from uploaded documents.",
         )
 
-    # Step 4: build training dataset
     n_samples = await run_in_threadpool(
-        build_domain_dataset,
-        docs,
-        DATASET_PATH,
-        80,
-        req.samples_per_chunk,
-        0.15,
+        build_domain_dataset, docs, DATASET_PATH, 80, req.samples_per_chunk, 0.15,
     )
     if n_samples == 0:
         raise HTTPException(
@@ -480,7 +413,6 @@ async def finetune_node(req: FineTuneRequest):
         data = [json.loads(line) for line in f if line.strip()]
     dataset = Dataset.from_list(data)
 
-    # Step 5: build LoRA params dict
     lora_params = {
         "lora_rank":              req.lora_rank,
         "lora_alpha":             req.lora_alpha,
@@ -493,13 +425,10 @@ async def finetune_node(req: FineTuneRequest):
         "gradient_checkpointing": req.gradient_checkpointing,
     }
 
-    # Step 6: determine output directory (FIX: always a proper subdirectory)
     lora_dir = _adapter_dir(req)
     os.makedirs(lora_dir, exist_ok=True)
     print(f"[api] Adapter will be saved → {lora_dir}")
 
-    # Step 7: train LoRA adapter
-    # FIX: Full traceback is now returned in the 500 detail for easier debugging
     try:
         await run_in_threadpool(train_domain_lora, req.model, dataset, lora_dir, lora_params)
     except MemoryError as e:
@@ -510,7 +439,6 @@ async def finetune_node(req: FineTuneRequest):
             detail=f"Training failed:\n{traceback.format_exc()}",
         )
 
-    # Step 8: reload inference model with adapter
     try:
         slm_component = await run_in_threadpool(
             lambda: DomainSLMComponent(req.model, VECTOR_DIR, lora_dir)
@@ -539,9 +467,7 @@ async def finetune_node(req: FineTuneRequest):
 
 @app.post("/node/load-adapter")
 async def load_adapter_node(req: LoadAdapterRequest):
-    """
-    Load a previously saved LoRA adapter by path.
-    """
+    """Load a previously saved LoRA adapter by path."""
     global slm_component, current_mode, current_model
 
     _validate_model(req.model)
@@ -562,7 +488,7 @@ async def load_adapter_node(req: LoadAdapterRequest):
 
     try:
         slm_component = await run_in_threadpool(
-            lambda: DomainSLMComponent(req.model, VECTOR_DIR, req.adapter_path)
+            lambda: DomainSLMComponent(req.model, VECTOR_DIR, req.adapter_path, req.mode)  # ← mode passed here
         )
     except Exception as e:
         raise HTTPException(
@@ -578,12 +504,12 @@ async def load_adapter_node(req: LoadAdapterRequest):
         "status":       "ready",
         "model":        req.model,
         "adapter_path": req.adapter_path,
+        "mode":         req.mode,              # ← show mode in response
     }
 
 
 @app.post("/node/inference", response_model=QueryResponse)
 async def inference_node(req: QueryRequest):
-    """Query the currently loaded model."""
     global slm_component
 
     if slm_component is None:
