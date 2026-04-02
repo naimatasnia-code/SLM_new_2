@@ -1,12 +1,10 @@
-
-
 import re
 import torch
 
 from core.prompt import build_prompt, build_chat_response
 from rag.retriever import ScoredRetriever
 
-# ── Synonym map (unchanged) ───────────────────────────────────────────────────
+# ── Synonym map ───────────────────────────────────────────────────────────────
 SYNONYM_MAP = {
     "recover":     ["recover", "cure", "treat", "heal", "therapy", "treatment", "recovery"],
     "cure":        ["cure", "treat", "recover", "therapy", "treatment", "healing"],
@@ -48,7 +46,6 @@ _GREETINGS = {"hi", "hello", "hey", "good morning", "good afternoon", "good even
 _THANKS    = {"thanks", "thank you", "thx", "ty", "appreciate it", "thank"}
 _FAREWELL  = {"bye", "goodbye", "see you", "exit", "quit", "farewell"}
 
-# Patterns that signal model went off-rails past the real answer
 _STOP_MARKERS = [
     r"\[END_OF_TEXT\]", r"\[END\]", r"\[\/INST\]",
     r"Step-by-step reasoning\s*:",
@@ -88,15 +85,6 @@ def _expand_query(question: str) -> str:
 
 
 def _context_is_relevant(query: str, context: str, threshold: float = 0.25) -> bool:
-    """
-    Second-pass relevance check BEFORE sending to LLM.
-    Counts how many meaningful query words appear in the context.
-    If overlap is too low, the retrieved chunks are about a different topic entirely.
-
-    Example: query="what is java", context=<kidney doc chunks>
-    → almost zero word overlap → returns False → out_of_scope returned immediately.
-    """
-    # Strip common stopwords so we only measure content word overlap
     STOPWORDS = {
         "what", "is", "are", "the", "a", "an", "of", "in", "to", "and",
         "or", "how", "why", "when", "where", "who", "does", "do", "can",
@@ -109,7 +97,7 @@ def _context_is_relevant(query: str, context: str, threshold: float = 0.25) -> b
         if w not in STOPWORDS and len(w) > 2
     }
     if not query_words:
-        return True  # can't judge → allow through
+        return True
 
     context_lower = context.lower()
     matched = sum(1 for w in query_words if w in context_lower)
@@ -118,25 +106,14 @@ def _context_is_relevant(query: str, context: str, threshold: float = 0.25) -> b
 
 
 def _is_hallucinated(answer: str, context: str) -> bool:
-    """
-    Post-generation check: if the model answered "I don't have information"
-    but then kept going with outside knowledge, detect and block it.
-
-    Also catches when the answer contains almost no words from the context
-    (i.e. the model answered entirely from its parametric memory).
-    """
     answer_lower = answer.lower()
 
-    # If answer starts with the no-info phrase but continues beyond it,
-    # the model obeyed for one sentence then kept going — truncate at first sentence.
     no_info_phrase = "i don't have information about this"
     if no_info_phrase in answer_lower:
-        # Keep only the first sentence (the "I don't have info" part)
         first_sentence_end = re.search(r'[.!?]', answer)
         if first_sentence_end:
-            return True   # signal to replace with clean out_of_scope message
+            return True
 
-    # Check if answer is suspiciously long AND uses almost no context vocabulary
     if len(answer.split()) > 40:
         STOPWORDS = {
             "the", "a", "an", "is", "are", "was", "were", "be", "been",
@@ -157,32 +134,23 @@ def _is_hallucinated(answer: str, context: str) -> bool:
         if not context_words:
             return False
         overlap = len(answer_words & context_words) / max(len(answer_words), 1)
-        if overlap < 0.15:   # less than 15% of answer words came from context
+        if overlap < 0.15:
             return True
 
     return False
 
 
 def _clean_response(text: str) -> str:
-    # 1. Cut at stop markers
     for marker in _STOP_MARKERS:
         parts = re.split(marker, text, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
             text = parts[0]
 
-    # 2. Convert literal \n text → real newline
     text = text.replace("\\n", "\n").replace("\\t", " ").replace("\\r", " ")
-
-    # 3. Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
-
-    # 4. Collapse multiple spaces
     text = re.sub(r"[ \t]{2,}", " ", text)
-
-    # 5. Fix space before punctuation
     text = re.sub(r"[ \t]+([.,!?;:])", r"\1", text)
 
-    # 6. Drop trailing incomplete sentence
     paragraphs = text.strip().split("\n\n")
     cleaned = []
     for para in paragraphs:
@@ -198,34 +166,68 @@ def _clean_response(text: str) -> str:
     return "\n\n".join(cleaned).strip()
 
 
+def _generate_from_model(tokenizer, model, question: str) -> dict:
+    """Shared generation logic for adapter-only mode."""
+    prompt = build_prompt("", question)
+    inputs = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=1024,
+    ).to(model.device)
+    prompt_len = inputs["input_ids"].shape[-1]
+
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=300,
+            do_sample=False,
+            repetition_penalty=1.2,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    generated_ids = output[0][prompt_len:]
+    raw_answer    = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    clean_answer  = _clean_response(raw_answer)
+
+    return {
+        "answer":            clean_answer,
+        "prompt_tokens":     prompt_len,
+        "completion_tokens": len(generated_ids),
+        "total_tokens":      prompt_len + len(generated_ids),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 class DocumentAgent:
-    """Domain-agnostic RAG agent — answers ONLY from uploaded documents."""
+    """
+    Domain-agnostic agent.
+    - adapter_only=True  → generates directly from adapter, no RAG needed
+    - adapter_only=False → RAG retrieval + generation (existing behaviour)
+    """
 
-    # Raised from 0.30 → 0.45: stricter gate, fewer irrelevant chunks pass through
     CONFIDENCE_THRESHOLD = 0.45
 
-    def __init__(self, tokenizer, model, retriever: "ScoredRetriever | None"):
-        self.tokenizer = tokenizer
-        self.model     = model
-        self.retriever = retriever
+    def __init__(self, tokenizer, model, retriever: "ScoredRetriever | None", adapter_only: bool = False):
+        self.tokenizer    = tokenizer
+        self.model        = model
+        self.retriever    = retriever
+        self.adapter_only = adapter_only
 
     def answer(self, question: str) -> dict:
         intent = _classify_intent(question)
         if intent != "rag":
             return self._static_response(build_chat_response(intent), question)
-        if self.retriever is None:
-            return self._static_response(build_chat_response("no_docs"), question)
 
-        # ── Retrieval ─────────────────────────────────────────────────────────
+        # ── Adapter-only mode ─────────────────────────────────────────────────
+        if self.adapter_only or self.retriever is None:
+            return _generate_from_model(self.tokenizer, self.model, question)
+
+        # ── RAG mode (existing code unchanged) ────────────────────────────────
         expanded_query = _expand_query(question)
         docs, best_score = self.retriever.invoke(expanded_query)
 
-        # Gate 1: vector similarity score
         if not docs or best_score < self.CONFIDENCE_THRESHOLD:
             return self._static_response(build_chat_response("out_of_scope"), question)
 
-        # Build context
         context_parts, budget = [], 1200
         for doc in docs:
             chunk = doc.page_content.strip()
@@ -236,11 +238,9 @@ class DocumentAgent:
                 break
         context = "\n\n".join(context_parts)
 
-        # Gate 2: content word overlap check (catches off-topic retrievals)
         if not _context_is_relevant(question, context):
             return self._static_response(build_chat_response("out_of_scope"), question)
 
-        # ── Generation ────────────────────────────────────────────────────────
         prompt = build_prompt(context, question)
         inputs = self.tokenizer(
             prompt, return_tensors="pt", truncation=True, max_length=1024,
@@ -261,7 +261,6 @@ class DocumentAgent:
         raw_answer    = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         clean_answer  = _clean_response(raw_answer)
 
-        # Gate 3: post-generation hallucination check
         if not clean_answer or len(clean_answer) < 10 or _is_hallucinated(clean_answer, context):
             return self._static_response(build_chat_response("out_of_scope"), question)
 
