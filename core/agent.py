@@ -166,9 +166,8 @@ def _clean_response(text: str) -> str:
     return "\n\n".join(cleaned).strip()
 
 
-def _generate_from_model(tokenizer, model, question: str) -> dict:
-    """Shared generation logic for adapter-only mode."""
-    prompt = build_prompt("", question)
+def _generate_from_model(tokenizer, model, question: str, mode: str = "generic") -> dict:
+    prompt = build_prompt("", question, mode)  # ← pass mode
     inputs = tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=1024,
     ).to(model.device)
@@ -203,30 +202,30 @@ class DocumentAgent:
     - adapter_only=True  → generates directly from adapter, no RAG needed
     - adapter_only=False → RAG retrieval + generation (existing behaviour)
     """
-
     CONFIDENCE_THRESHOLD = 0.45
 
-    def __init__(self, tokenizer, model, retriever: "ScoredRetriever | None", adapter_only: bool = False):
+    def __init__(self, tokenizer, model, retriever: "ScoredRetriever | None",
+                 adapter_only: bool = False, mode: str = "generic"):  # ← add mode
         self.tokenizer    = tokenizer
         self.model        = model
         self.retriever    = retriever
         self.adapter_only = adapter_only
+        self.mode         = mode  # ← store it
 
     def answer(self, question: str) -> dict:
         intent = _classify_intent(question)
         if intent != "rag":
-            return self._static_response(build_chat_response(intent), question)
+            return self._static_response(build_chat_response(intent, self.mode), question)  # ← add self.mode
 
-        # ── Adapter-only mode ─────────────────────────────────────────────────
         if self.adapter_only or self.retriever is None:
-            return _generate_from_model(self.tokenizer, self.model, question)
+            return _generate_from_model(self.tokenizer, self.model, question, self.mode)  # ← add self.mode
 
-        # ── RAG mode (existing code unchanged) ────────────────────────────────
+        # RAG path
         expanded_query = _expand_query(question)
         docs, best_score = self.retriever.invoke(expanded_query)
 
         if not docs or best_score < self.CONFIDENCE_THRESHOLD:
-            return self._static_response(build_chat_response("out_of_scope"), question)
+            return self._static_response(build_chat_response("out_of_scope", self.mode), question)  # ← add self.mode
 
         context_parts, budget = [], 1200
         for doc in docs:
@@ -239,9 +238,9 @@ class DocumentAgent:
         context = "\n\n".join(context_parts)
 
         if not _context_is_relevant(question, context):
-            return self._static_response(build_chat_response("out_of_scope"), question)
+            return self._static_response(build_chat_response("out_of_scope", self.mode), question)  # ← add self.mode
 
-        prompt = build_prompt(context, question)
+        prompt = build_prompt(context, question, self.mode)  # ← add self.mode
         inputs = self.tokenizer(
             prompt, return_tensors="pt", truncation=True, max_length=1024,
         ).to(self.model.device)

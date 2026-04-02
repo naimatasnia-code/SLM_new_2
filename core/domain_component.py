@@ -5,7 +5,8 @@ from rag.retriever import load_retriever
 from core.agent import DocumentAgent
 
 class DomainSLMComponent:
-    def __init__(self, model_name: str, vector_dir: str, lora_path: str | None = None):
+    def __init__(self, model_name: str, vector_dir: str,
+                 lora_path: str | None = None, mode: str = "generic"):  # ← add mode
         self.tokenizer, self.model = load_model(model_name, lora_path)
 
         faiss_index = os.path.join(vector_dir, "index.faiss")
@@ -16,7 +17,9 @@ class DomainSLMComponent:
             retriever    = None
             adapter_only = True
 
-        self.agent = DocumentAgent(self.tokenizer, self.model, retriever, adapter_only)
+        self.agent = DocumentAgent(
+            self.tokenizer, self.model, retriever, adapter_only, mode  #  pass mode
+        )
 
     def run(self, question: str) -> dict:
         start = time.time()

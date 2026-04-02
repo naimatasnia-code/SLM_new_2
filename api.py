@@ -121,6 +121,12 @@ class BioRagRequest(BaseModel):
 class LoadAdapterRequest(BaseModel):
     model: str
     adapter_path: str
+    mode: str = "generic"
+
+# in load_adapter_node:
+slm_component = await run_in_threadpool(
+    lambda: DomainSLMComponent(req.model, VECTOR_DIR, req.adapter_path, req.mode)  # pass mode
+)
 
 class FineTuneRequest(BaseModel):
     model: str
