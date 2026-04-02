@@ -324,13 +324,49 @@ async def list_adapters():
 
 
 @app.post("/node/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Upload a PDF or DOCX and index it into the vector DB."""
-    path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    await run_in_threadpool(build_index, [path], VECTOR_DIR)
-    return {"node": "upload", "status": "indexed", "file": file.filename}
+async def upload_document(files: List[UploadFile] = File(...)):
+    """
+    Upload one or more PDF or DOCX files and index them all into the vector DB.
+
+    Send multiple files in a single request using repeated 'files' form fields:
+      files = doc1.pdf
+      files = doc2.pdf
+      files = doc3.docx
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    saved_paths = []
+    uploaded_names = []
+    skipped = []
+
+    for file in files:
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in (".pdf", ".docx"):
+            skipped.append(file.filename)
+            continue
+        path = os.path.join(UPLOAD_DIR, file.filename)
+        with open(path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        saved_paths.append(path)
+        uploaded_names.append(file.filename)
+
+    if not saved_paths:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No valid files to index. Only PDF and DOCX are supported. Skipped: {skipped}",
+        )
+
+    # Index all files in one pass — more efficient than one-by-one
+    await run_in_threadpool(build_index, saved_paths, VECTOR_DIR)
+
+    return {
+        "node":     "upload",
+        "status":   "indexed",
+        "files":    uploaded_names,
+        "count":    len(uploaded_names),
+        "skipped":  skipped,
+    }
 
 
 @app.post("/node/rag")

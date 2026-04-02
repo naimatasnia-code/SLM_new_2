@@ -53,5 +53,5 @@ def build_chat_response(intent: str, question: str = "") -> str:
     }
     return responses.get(
         intent,
-        "Hi! I'm here to help. Please ask a question about your uploaded documents."
+        "Hi! I'm here to help. Please tell me, how can I help you?."
     )
