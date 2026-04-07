@@ -21,7 +21,7 @@ STRICT RULES:
 2. Match meaning across synonyms ("recover" = "cure" = "treat", "biological age" = "epigenetic age").
 3. If multiple CONTEXT sections are relevant, COMBINE them into one complete answer.
 4. Reason step by step internally before writing your answer, but do NOT show reasoning steps.
-5. Answer in clear, complete sentences. Use numbered points for multi-part answers.
+5. Answer in clear, complete sentences in plain paragraphs. Do NOT use numbered lists.
 6. Simulate how a real person would ask this — answer both the literal question AND its intent.
 7. Do NOT write disclaimers, notes, "please consult", or reasoning steps in your answer.
 8. Do NOT repeat the question back. Start directly with the answer.
@@ -54,7 +54,7 @@ If you don't have enough information, respond:
 "I don't have enough information in my knowledge base to answer that."
 Do NOT use outside knowledge beyond your dermatology training.
 Do NOT write disclaimers or suggest consulting a doctor.
-Answer in clear, complete clinical sentences.
+Answer in clear, complete sentences in plain paragraphs. Do NOT use numbered lists.
 {context_block}</s>
 <|user|>
 {question}</s>
