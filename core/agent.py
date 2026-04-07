@@ -62,6 +62,15 @@ _STOP_MARKERS = [
     r"What do you want to know",
 ]
 
+# ── Filler / trailing phrases the model appends when it runs out of content ───
+_FILLER_PATTERNS = [
+    r"the availability of treatments[\w\s,]*\.",
+    r"it is important to note that[\w\s,]*\.",
+    r"in (summary|conclusion|general)[\w\s,]*\.",
+    r"overall[\w\s,]*\.",
+    r"as (mentioned|noted|stated) (above|earlier|previously)[\w\s,]*\.",
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def _classify_intent(question: str) -> str:
@@ -141,6 +150,7 @@ def _is_hallucinated(answer: str, context: str) -> bool:
 
 
 def _clean_response(text: str) -> str:
+    """Original cleaner: stop markers, whitespace normalisation, incomplete sentence trim."""
     for marker in _STOP_MARKERS:
         parts = re.split(marker, text, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
@@ -166,8 +176,68 @@ def _clean_response(text: str) -> str:
     return "\n\n".join(cleaned).strip()
 
 
+def _clean_answer(text: str) -> str:
+    """
+    Post-processor applied AFTER _clean_response.
+
+    1. Detects empty numbered list items (e.g. "3.\n\n4.\n") that indicate the
+       model ran out of knowledge and started generating hollow structure.
+       Cuts the answer before the first such empty item.
+
+    2. Removes trailing filler lines (model padding phrases).
+
+    3. Deduplicates repeated sentence fragments (TinyLlama loop pattern).
+    """
+    # ── 1. Cut before empty numbered-list items ───────────────────────────────
+    # Matches patterns like:  "3.\n"  or  "3. \n"  or  "3.\n\n4."
+    # i.e. a list number followed by nothing meaningful on the same line.
+    empty_item_pattern = re.compile(
+        r'\n\s*\d+\.\s*\n',   # newline, optional spaces, digit(s), dot, newline
+        re.MULTILINE,
+    )
+    match = empty_item_pattern.search(text)
+    if match:
+        text = text[:match.start()].rstrip()
+
+    # ── 2. Strip trailing filler lines ────────────────────────────────────────
+    lines = text.split("\n")
+    while lines:
+        last = lines[-1].strip().lower()
+        if not last:
+            lines.pop()
+            continue
+        is_filler = any(
+            re.search(p, last, re.IGNORECASE) for p in _FILLER_PATTERNS
+        )
+        if is_filler:
+            lines.pop()
+        else:
+            break
+    text = "\n".join(lines).strip()
+
+    # ── 3. Deduplicate repeated fragments (≥ 6 consecutive words) ────────────
+    # Build list of sentences, drop any sentence whose core content already
+    # appeared in a previous sentence.
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    seen_ngrams: set = set()
+    deduped = []
+    for sent in sentences:
+        words = sent.lower().split()
+        if len(words) < 6:
+            deduped.append(sent)
+            continue
+        # Use a 6-gram fingerprint of the first half as the dedup key
+        key = tuple(words[:6])
+        if key not in seen_ngrams:
+            seen_ngrams.add(key)
+            deduped.append(sent)
+    text = " ".join(deduped).strip()
+
+    return text
+
+
 def _generate_from_model(tokenizer, model, question: str, mode: str = "generic") -> dict:
-    prompt = build_prompt("", question, mode)  # ← pass mode
+    prompt = build_prompt("", question, mode)
     inputs = tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=1024,
     ).to(model.device)
@@ -176,16 +246,17 @@ def _generate_from_model(tokenizer, model, question: str, mode: str = "generic")
     with torch.no_grad():
         output = model.generate(
             **inputs,
-            max_new_tokens=300,
+            max_new_tokens=512,           # FIX 2: was 256 → 512, prevents mid-thought cut-off
             do_sample=False,
-            repetition_penalty=1.2,
+            repetition_penalty=1.3,       # FIX 3: was 1.2 → 1.3, stronger loop suppression
+            no_repeat_ngram_size=4,       # FIX 4: blocks any 4-word phrase from repeating
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
 
     generated_ids = output[0][prompt_len:]
     raw_answer    = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    clean_answer  = _clean_response(raw_answer)
+    clean_answer  = _clean_answer(_clean_response(raw_answer))  # FIX 5: two-stage clean
 
     return {
         "answer":            clean_answer,
@@ -205,27 +276,27 @@ class DocumentAgent:
     CONFIDENCE_THRESHOLD = 0.45
 
     def __init__(self, tokenizer, model, retriever: "ScoredRetriever | None",
-                 adapter_only: bool = False, mode: str = "generic"):  # ← add mode
+                 adapter_only: bool = False, mode: str = "generic"):
         self.tokenizer    = tokenizer
         self.model        = model
         self.retriever    = retriever
         self.adapter_only = adapter_only
-        self.mode         = mode  # ← store it
+        self.mode         = mode
 
     def answer(self, question: str) -> dict:
         intent = _classify_intent(question)
         if intent != "rag":
-            return self._static_response(build_chat_response(intent, self.mode), question)  # ← add self.mode
+            return self._static_response(build_chat_response(intent, self.mode), question)
 
         if self.adapter_only or self.retriever is None:
-            return _generate_from_model(self.tokenizer, self.model, question, self.mode)  # ← add self.mode
+            return _generate_from_model(self.tokenizer, self.model, question, self.mode)
 
         # RAG path
         expanded_query = _expand_query(question)
         docs, best_score = self.retriever.invoke(expanded_query)
 
         if not docs or best_score < self.CONFIDENCE_THRESHOLD:
-            return self._static_response(build_chat_response("out_of_scope", self.mode), question)  # ← add self.mode
+            return self._static_response(build_chat_response("out_of_scope", self.mode), question)
 
         context_parts, budget = [], 1200
         for doc in docs:
@@ -238,9 +309,9 @@ class DocumentAgent:
         context = "\n\n".join(context_parts)
 
         if not _context_is_relevant(question, context):
-            return self._static_response(build_chat_response("out_of_scope", self.mode), question)  # ← add self.mode
+            return self._static_response(build_chat_response("out_of_scope", self.mode), question)
 
-        prompt = build_prompt(context, question, self.mode)  # ← add self.mode
+        prompt = build_prompt(context, question, self.mode)
         inputs = self.tokenizer(
             prompt, return_tensors="pt", truncation=True, max_length=1024,
         ).to(self.model.device)
@@ -249,16 +320,17 @@ class DocumentAgent:
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=300,
+                max_new_tokens=512,           # FIX 2: was 256 → 512
                 do_sample=False,
-                repetition_penalty=1.2,
+                repetition_penalty=1.3,       # FIX 3: was 1.2 → 1.3
+                no_repeat_ngram_size=4,       # FIX 4: new parameter
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
         generated_ids = output[0][prompt_len:]
         raw_answer    = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        clean_answer  = _clean_response(raw_answer)
+        clean_answer  = _clean_answer(_clean_response(raw_answer))  # FIX 5: two-stage clean
 
         if not clean_answer or len(clean_answer) < 10 or _is_hallucinated(clean_answer, context):
             return self._static_response(build_chat_response("out_of_scope"), question)
