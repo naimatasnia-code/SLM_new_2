@@ -22,3 +22,7 @@ services:
       - ACCESS_KEY=minio
       - SECRET_KEY=password
       - NODE_STORAGE_REF=nodes_bucket
+      # ── Auto-load adapter on startup ──────────────────────────────
+      - DEFAULT_MODEL=tinyllama
+      - DEFAULT_ADAPTER_PATH=adapters/derma_v1.0
+      - DEFAULT_ADAPTER_MODE=derma
