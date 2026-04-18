@@ -9,6 +9,7 @@ import datetime
 import traceback
 
 import torch
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -92,8 +93,50 @@ MODEL_CATALOG = [
     {"id": "phi-2",      "label": "Phi-2 (2.7B)",       "cpu_safe": False, "vram_gb": 6.0},
 ]
 
+# ── Global state ──────────────────────────────────────────────────────────────
+slm_component = None
+current_mode  = None
+current_model = None
+
+
+# ── Auto-load on startup ──────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global slm_component, current_mode, current_model
+
+    default_model        = os.getenv("DEFAULT_MODEL",        "tinyllama")
+    default_adapter_path = os.getenv("DEFAULT_ADAPTER_PATH", "adapters/derma_v1.0")
+    default_adapter_mode = os.getenv("DEFAULT_ADAPTER_MODE", "derma")
+
+    cfg_path = os.path.join(default_adapter_path, "adapter_config.json")
+
+    if os.path.isdir(default_adapter_path) and os.path.exists(cfg_path):
+        log.info(f"[startup] Auto-loading adapter: {default_adapter_path} (mode={default_adapter_mode})")
+        try:
+            slm_component = await run_in_threadpool(
+                lambda: DomainSLMComponent(
+                    default_model,
+                    VECTOR_DIR,
+                    default_adapter_path,
+                    default_adapter_mode,
+                )
+            )
+            current_mode  = "finetune"
+            current_model = default_model
+            log.info(f"[startup] ✅ Adapter loaded successfully: {default_adapter_path}")
+        except Exception:
+            log.error(f"[startup] ❌ Failed to auto-load adapter:\n{traceback.format_exc()}")
+    else:
+        log.warning(
+            f"[startup] ⚠️  No adapter found at '{default_adapter_path}' — "
+            f"starting without a model. Call /node/load-adapter to load one."
+        )
+
+    yield  # ← app runs here
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Chatbot SLM Component")
+app = FastAPI(title="Chatbot SLM Component", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -101,11 +144,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-# ── Global state ──────────────────────────────────────────────────────────────
-slm_component = None
-current_mode  = None
-current_model = None
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -120,7 +158,7 @@ class BioRagRequest(BaseModel):
 class LoadAdapterRequest(BaseModel):
     model: str
     adapter_path: str
-    mode: str = "generic"          # ← "derma" for dermatology adapter
+    mode: str = "generic"
 
 class FineTuneRequest(BaseModel):
     model: str
@@ -488,7 +526,7 @@ async def load_adapter_node(req: LoadAdapterRequest):
 
     try:
         slm_component = await run_in_threadpool(
-            lambda: DomainSLMComponent(req.model, VECTOR_DIR, req.adapter_path, req.mode)  # ← mode passed here
+            lambda: DomainSLMComponent(req.model, VECTOR_DIR, req.adapter_path, req.mode)
         )
     except Exception as e:
         raise HTTPException(
@@ -504,7 +542,7 @@ async def load_adapter_node(req: LoadAdapterRequest):
         "status":       "ready",
         "model":        req.model,
         "adapter_path": req.adapter_path,
-        "mode":         req.mode,              # ← show mode in response
+        "mode":         req.mode,
     }
 
 
@@ -517,7 +555,7 @@ async def inference_node(req: QueryRequest):
         if slm_component is None:
             raise HTTPException(
                 status_code=400,
-                detail="No model loaded. Call /node/rag or /node/finetune first.",
+                detail="No model loaded. Call /node/load-adapter or /node/rag first.",
             )
 
     start  = time.time()
