@@ -2,13 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy requirements first for caching
+# Install only essential system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for layer caching
 COPY requirements.txt .
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies, skip cache to save disk space
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip cache purge
 
-# Copy the rest of your code
+# Copy source code only (NO model weights — they come via volume or HF cache)
 COPY core ./core
 COPY rag ./rag
 COPY model ./model
