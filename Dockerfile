@@ -1,36 +1,36 @@
-FROM python:3.11-slim
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi
+uvicorn
+python-multipart
 
-WORKDIR /app
+# ── LangChain ─────────────────────────────────────────────────────────────────
+langchain
+langchain-community
+langchain-huggingface
+langchain-text-splitters
 
-# Install only essential system deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# ── ML / AI ───────────────────────────────────────────────────────────────────
+# torch is intentionally NOT listed here.
+# It is installed separately in Dockerfile with CPU-only wheels.
+transformers==4.46.3
+sentence-transformers==3.3.1
+datasets
+peft
+accelerate
 
-COPY requirements.txt .
+# ── NumPy pinned to <2 to avoid binary compatibility crashes ──────────────────
+numpy<2
 
-# ── KEY FIX: Install CPU-only PyTorch FIRST before everything else ────────────
-# This prevents pip from pulling in the full CUDA build (~2.5GB saved)
-# and avoids triton/cupti GPU libs that cause "no space left" errors
-RUN pip install --no-cache-dir \
-    torch==2.2.2 \
-    --index-url https://download.pytorch.org/whl/cpu \
-    && pip cache purge
+# ── Vector DB / RAG ───────────────────────────────────────────────────────────
+faiss-cpu
+chromadb
+pysqlite3-binary
 
-# Now install the rest of requirements (torch already satisfied, won't re-download)
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip cache purge
+# ── Document parsing ──────────────────────────────────────────────────────────
+pypdf
+unstructured
+python-docx
 
-# Remove triton if it still got pulled in (GPU-only, useless on CPU)
-RUN pip uninstall -y triton 2>/dev/null || true
-
-COPY core ./core
-COPY rag ./rag
-COPY model ./model
-COPY adapters ./adapters
-COPY data ./data
-COPY api.py .
-
-EXPOSE 8000
-
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+# ── Storage / Utils ───────────────────────────────────────────────────────────
+minio>=7.2
+psutil
