@@ -1,36 +1,33 @@
-# ── Web framework ─────────────────────────────────────────────────────────────
-fastapi
-uvicorn
-python-multipart
+FROM python:3.11-slim
 
-# ── LangChain ─────────────────────────────────────────────────────────────────
-langchain
-langchain-community
-langchain-huggingface
-langchain-text-splitters
+WORKDIR /app
 
-# ── ML / AI ───────────────────────────────────────────────────────────────────
-# torch is intentionally NOT listed here.
-# It is installed separately in Dockerfile with CPU-only wheels.
-transformers==4.46.3
-sentence-transformers==3.3.1
-datasets
-peft
-accelerate
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
-# ── NumPy pinned to <2 to avoid binary compatibility crashes ──────────────────
-numpy<2
+COPY requirements.txt .
 
-# ── Vector DB / RAG ───────────────────────────────────────────────────────────
-faiss-cpu
-chromadb
-pysqlite3-binary
+# ── Install CPU-only PyTorch 2.4.1 (satisfies transformers>=2.4 requirement) ──
+RUN pip install --no-cache-dir \
+    torch==2.4.1 \
+    --index-url https://download.pytorch.org/whl/cpu \
+    && pip cache purge
 
-# ── Document parsing ──────────────────────────────────────────────────────────
-pypdf
-unstructured
-python-docx
+# ── Install everything else (torch already pinned, won't be overwritten) ──────
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip cache purge
 
-# ── Storage / Utils ───────────────────────────────────────────────────────────
-minio>=7.2
-psutil
+# ── Remove triton if anything sneaked it in ───────────────────────────────────
+RUN pip uninstall -y triton 2>/dev/null || true
+
+COPY core ./core
+COPY rag ./rag
+COPY model ./model
+COPY adapters ./adapters
+COPY data ./data
+COPY api.py .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
